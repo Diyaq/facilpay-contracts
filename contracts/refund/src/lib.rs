@@ -402,6 +402,10 @@ pub struct Refund {
     pub requested_at: u64,
     pub reason: String,
     pub reason_code: RefundReasonCode,
+    // Issue #147: Lifecycle timestamps
+    pub approved_at: Option<u64>,
+    pub rejected_at: Option<u64>,
+    pub processed_at: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -413,6 +417,16 @@ pub struct MerchantRefundSummary {
     pub total_amount_refunded: i128,
     pub pending_count: u64,
     pub pending_amount: i128,
+}
+
+// Issue #147: Customer refund summary
+#[derive(Clone)]
+#[contracttype]
+pub struct CustomerRefundSummary {
+    pub total_requested: u64,
+    pub total_approved: u64,
+    pub total_amount_refunded: i128,
+    pub avg_processing_time: u64,
 }
 
 #[derive(Clone)]
@@ -851,6 +865,8 @@ impl RefundContract {
 
         // Update refund status to Rejected
         refund.status = RefundStatus::Rejected;
+        // Issue #147: Set rejected_at timestamp
+        refund.rejected_at = Some(env.ledger().timestamp());
 
         // Store updated refund back to storage
         env.storage().instance().set(&DataKey::Refund(refund_id), &refund);
@@ -3029,6 +3045,14 @@ impl RefundContract {
             requested_at: env.ledger().timestamp(),
             reason,
             reason_code,
+            // Issue #147: Initialize lifecycle timestamps
+            approved_at: if initial_status == RefundStatus::Approved {
+                Some(env.ledger().timestamp())
+            } else {
+                None
+            },
+            rejected_at: None,
+            processed_at: None,
         };
 
         env.storage().instance().set(&DataKey::Refund(refund_id), &refund);
@@ -3110,6 +3134,8 @@ impl RefundContract {
 
         Self::remove_from_status_index(env, RefundStatus::Requested, refund_id)?;
         refund.status = RefundStatus::Approved;
+        // Issue #147: Set approved_at timestamp
+        refund.approved_at = Some(env.ledger().timestamp());
         env.storage().instance().set(&DataKey::Refund(refund_id), &refund);
         Self::add_to_status_index(env, RefundStatus::Approved, refund_id);
 
@@ -3146,6 +3172,8 @@ impl RefundContract {
 
         Self::remove_from_status_index(env, RefundStatus::Approved, refund_id)?;
         refund.status = RefundStatus::Processed;
+        // Issue #147: Set processed_at timestamp
+        refund.processed_at = Some(env.ledger().timestamp());
         env.storage().instance().set(&DataKey::Refund(refund_id), &refund);
         Self::add_to_status_index(env, RefundStatus::Processed, refund_id);
 
@@ -3789,6 +3817,118 @@ impl RefundContract {
         refund_count
     }
 
+    // Issue #147: Customer refund history functions
+    
+    /// Get paginated refund history for a customer, sorted newest-first
+    pub fn get_customer_refund_history(
+        env: Env,
+        customer: Address,
+        limit: u64,
+        offset: u64,
+    ) -> Vec<Refund> {
+        let mut results: Vec<Refund> = Vec::new(&env);
+        let total = Self::get_customer_refund_count(&env, &customer);
+
+        if limit == 0 || offset >= total {
+            return results;
+        }
+
+        // Calculate range for newest-first ordering
+        let end = core::cmp::min(total, offset.saturating_add(limit));
+        
+        // Iterate in reverse order (newest first)
+        let mut collected = 0u64;
+        let mut skipped = 0u64;
+        let mut index = total;
+        
+        while index > 0 && collected < limit {
+            index -= 1;
+            
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            
+            if let Some(refund_id) = env
+                .storage()
+                .instance()
+                .get::<_, u64>(&DataKey::CustomerRefunds(customer.clone(), index))
+            {
+                if let Some(refund) = env
+                    .storage()
+                    .instance()
+                    .get::<_, Refund>(&DataKey::Refund(refund_id))
+                {
+                    results.push_back(refund);
+                    collected += 1;
+                }
+            }
+        }
+
+        results
+    }
+
+    /// Get the total count of refunds for a customer (public version)
+    pub fn get_customer_refund_count_public(env: Env, customer: Address) -> u64 {
+        Self::get_customer_refund_count(&env, &customer)
+    }
+
+    /// Get summary statistics for a customer's refunds
+    pub fn get_customer_refund_summary(env: Env, customer: Address) -> CustomerRefundSummary {
+        let total_requested = Self::get_customer_refund_count(&env, &customer);
+        let mut total_approved = 0u64;
+        let mut total_amount_refunded = 0i128;
+        let mut total_processing_time = 0u64;
+        let mut processed_count = 0u64;
+
+        let mut index = 0u64;
+        while index < total_requested {
+            if let Some(refund_id) = env
+                .storage()
+                .instance()
+                .get::<_, u64>(&DataKey::CustomerRefunds(customer.clone(), index))
+            {
+                if let Some(refund) = env
+                    .storage()
+                    .instance()
+                    .get::<_, Refund>(&DataKey::Refund(refund_id))
+                {
+                    match refund.status {
+                        RefundStatus::Approved | RefundStatus::Processed => {
+                            total_approved += 1;
+                        }
+                        _ => {}
+                    }
+
+                    if refund.status == RefundStatus::Processed {
+                        total_amount_refunded += refund.amount;
+                        
+                        // Calculate processing time if we have both timestamps
+                        if let Some(processed_at) = refund.processed_at {
+                            let processing_time = processed_at.saturating_sub(refund.requested_at);
+                            total_processing_time = total_processing_time.saturating_add(processing_time);
+                            processed_count += 1;
+                        }
+                    }
+                }
+            }
+            index += 1;
+        }
+
+        let avg_processing_time = if processed_count > 0 {
+            total_processing_time / processed_count
+        } else {
+            0
+        };
+
+        CustomerRefundSummary {
+            total_requested,
+            total_approved,
+            total_amount_refunded,
+            avg_processing_time,
+        }
+    }
+
     fn get_merchant_refund_count(env: &Env, merchant: &Address) -> u64 {
         env.storage().instance().get(&DataKey::MerchantRefundCount(merchant.clone())).unwrap_or(0)
     }
@@ -4117,3 +4257,4 @@ mod test_inheritance;
 
 #[cfg(test)]
 mod test_notification_hooks;
+mod test_customer_history;
