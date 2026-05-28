@@ -62,6 +62,7 @@ pub enum DataKey {
     // Conditional escrow (on-chain state)
     ConditionalEscrow(u64),
     SuccessionPlan,
+    GlobalExpiryConfig,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -188,6 +189,9 @@ pub enum Error {
     InvalidThreshold = 57,
     WeightUpdateLocked = 58,
     ParticipantNotFound = 59,
+    EscrowNotExpired = 60,
+    EscrowAlreadyExpired = 61,
+    ExpiryBeforeRelease = 62,
 }
 
 #[contractevent]
@@ -471,6 +475,8 @@ pub struct Escrow {
     pub escalation_level: u64,
     pub min_hold_period: u64,
     pub fee_bps: i128,
+    pub expiry_timestamp: u64,       // 0 = no expiry
+    pub auto_refund_on_expiry: bool,
 }
 
 #[derive(Clone)]
@@ -938,6 +944,20 @@ pub struct ConditionalEscrow {
 pub struct ConditionEvaluated {
     pub escrow_id: u64,
     pub met: bool,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowExpired {
+    pub escrow_id: u64,
+    pub refunded_to: Address,
+    pub amount: i128,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct GlobalExpiryConfig {
+    pub default_expiry_seconds: u64,
 }
 
 #[contractevent]
@@ -1488,8 +1508,15 @@ impl EscrowContract {
         token: Address,
         release_timestamp: u64,
         min_hold_period: u64,
-    ) -> u64 {
+        expiry_timestamp: u64,
+        auto_refund_on_expiry: bool,
+    ) -> Result<u64, Error> {
         customer.require_auth();
+
+        // Validate expiry: if set (non-zero), must be strictly after release_timestamp
+        if expiry_timestamp != 0 && expiry_timestamp <= release_timestamp {
+            return Err(Error::ExpiryBeforeRelease);
+        }
 
         let counter: u64 = env
             .storage()
@@ -1521,6 +1548,8 @@ impl EscrowContract {
             escalation_level: 0,
             min_hold_period,
             fee_bps,
+            expiry_timestamp,
+            auto_refund_on_expiry,
         };
 
         env.storage()
@@ -1592,7 +1621,7 @@ impl EscrowContract {
         }
         .publish(&env);
 
-        escrow_id
+        Ok(escrow_id)
     }
 
     pub fn create_multi_party_escrow(
@@ -3230,6 +3259,8 @@ impl EscrowContract {
             escalation_level: 0,
             min_hold_period: 0,
             fee_bps,
+            expiry_timestamp: 0,
+            auto_refund_on_expiry: false,
         };
 
         env.storage()
@@ -5113,6 +5144,8 @@ impl EscrowContract {
             escalation_level: 0,
             min_hold_period: 0,
             fee_bps,
+            expiry_timestamp: 0,
+            auto_refund_on_expiry: false,
         };
 
         env.storage()
@@ -5673,6 +5706,8 @@ impl EscrowContract {
             escalation_level: 0,
             min_hold_period: 0, // Default for batch
             fee_bps: 0,         // Default fee
+            expiry_timestamp: 0,
+            auto_refund_on_expiry: false,
         };
 
         env.storage()
@@ -5767,6 +5802,75 @@ impl EscrowContract {
         Ok(())
     }
 
+    // ── EXPIRY ────────────────────────────────────────────────────────────
+
+    pub fn set_global_expiry_config(
+        env: Env,
+        admin: Address,
+        default_expiry_seconds: u64,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let config = Self::get_multisig_config(env.clone());
+        if !config.admins.contains(&admin) {
+            return Err(Error::NotAnAdmin);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::GlobalExpiryConfig, &GlobalExpiryConfig { default_expiry_seconds });
+        Ok(())
+    }
+
+    pub fn is_escrow_expired(env: Env, escrow_id: u64) -> bool {
+        if !env.storage().instance().has(&DataKey::Escrow(escrow_id)) {
+            return false;
+        }
+        let escrow = Self::get_escrow(&env, escrow_id);
+        if escrow.expiry_timestamp == 0 {
+            return false;
+        }
+        env.ledger().timestamp() >= escrow.expiry_timestamp
+    }
+
+    pub fn expire_escrow(env: Env, escrow_id: u64) -> Result<(), Error> {
+        if !env.storage().instance().has(&DataKey::Escrow(escrow_id)) {
+            return Err(Error::EscrowNotFound);
+        }
+        let mut escrow = Self::get_escrow(&env, escrow_id);
+
+        match escrow.status {
+            EscrowStatus::Released | EscrowStatus::Resolved | EscrowStatus::Cancelled => {
+                return Err(Error::EscrowAlreadyExpired);
+            }
+            EscrowStatus::Disputed => return Err(Error::InvalidStatus),
+            EscrowStatus::Locked => {}
+        }
+
+        if escrow.expiry_timestamp == 0 || env.ledger().timestamp() < escrow.expiry_timestamp {
+            return Err(Error::EscrowNotExpired);
+        }
+
+        escrow.status = EscrowStatus::Cancelled;
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(escrow_id), &escrow);
+
+        EscrowContract::transfer_if_token_contract(
+            &env,
+            &escrow.token,
+            &escrow.customer,
+            escrow.amount,
+        )?;
+
+        EscrowExpired {
+            escrow_id,
+            refunded_to: escrow.customer.clone(),
+            amount: escrow.amount,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
     // ── ANALYTICS HELPERS ─────────────────────────────────────────────────
 
     fn update_customer_analytics<F>(env: &Env, customer: &Address, update_fn: F)
@@ -5834,3 +5938,6 @@ mod multi_party_dispute_test;
 
 #[cfg(test)]
 mod pause_history_test;
+
+#[cfg(test)]
+mod expiry_test;
