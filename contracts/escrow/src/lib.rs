@@ -1039,6 +1039,7 @@ pub struct WatchdogConfig {
     pub inactivity_release_seconds: u64,
     pub enabled: bool,
     pub favor_customer_on_release: bool,
+    pub keeper_reward_bps: u32,
 }
 
 #[derive(Clone)]
@@ -1660,6 +1661,15 @@ pub struct EscrowExpired {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeeperReward {
+    pub escrow_id: u64,
+    pub keeper: Address,
+    pub reward_amount: i128,
+    pub trigger_type: String,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TimeoutResolutionTriggered {
     pub escrow_id: u64,
     pub favor: AutoResolveFavor,
@@ -1670,6 +1680,7 @@ pub struct TimeoutResolutionTriggered {
 #[contracttype]
 pub struct GlobalExpiryConfig {
     pub default_expiry_seconds: u64,
+    pub keeper_reward_bps: u32,
 }
 
 #[derive(Clone)]
@@ -9728,6 +9739,9 @@ impl EscrowContract {
         if !multisig.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
+        if config.keeper_reward_bps > 10000 {
+            return Err(Error::Basic(BasicError::InvalidBps));
+        }
         env.storage()
             .instance()
             .set(&DataKey::Config(ConfigKey::WatchdogConfig), &config);
@@ -9948,6 +9962,7 @@ impl EscrowContract {
                 inactivity_release_seconds: 604800, // 7 days
                 enabled: false,
                 favor_customer_on_release: false,
+                keeper_reward_bps: 0,
             })
     }
 
@@ -9993,6 +10008,7 @@ impl EscrowContract {
     ///
     /// # Arguments
     /// * `env` - Soroban environment.
+    /// * `keeper` - Address of the keeper calling this function (will receive reward).
     /// * `escrow_id` - Identifier for the requested object.
     ///
     /// # Returns
@@ -10000,7 +10016,7 @@ impl EscrowContract {
     ///
     /// # Errors
     /// Returns `Err(Error)` when the operation cannot be completed.
-    pub fn trigger_watchdog_release(env: Env, escrow_id: u64) -> Result<(), Error> {
+    pub fn trigger_watchdog_release(env: Env, keeper: Address, escrow_id: u64) -> Result<(), Error> {
         Self::bump_instance_ttl(&env);
         Self::require_not_paused(&env, "trigger_watchdog_release")?;
         if !Self::is_watchdog_eligible(env.clone(), escrow_id) {
@@ -10026,12 +10042,38 @@ impl EscrowContract {
             .instance()
             .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
 
-        Self::transfer_if_token_contract(&env, &escrow.token, &released_to, escrow.amount)?;
+        // Calculate keeper reward from platform fee
+        let platform_fee_amount = (escrow.amount * escrow.fee_bps) / 10000;
+        let keeper_reward = if config.keeper_reward_bps > 0 && platform_fee_amount > 0 {
+            (platform_fee_amount * config.keeper_reward_bps as i128) / 10000
+        } else {
+            0
+        };
+
+        let release_amount = escrow.amount - keeper_reward;
+
+        // Transfer funds to released_to (minus keeper reward)
+        if release_amount > 0 {
+            Self::transfer_if_token_contract(&env, &escrow.token, &released_to, release_amount)?;
+        }
+
+        // Transfer keeper reward
+        if keeper_reward > 0 {
+            Self::transfer_if_token_contract(&env, &escrow.token, &keeper, keeper_reward)?;
+
+            KeeperReward {
+                escrow_id,
+                keeper: keeper.clone(),
+                reward_amount: keeper_reward,
+                trigger_type: String::from_str(&env, "watchdog"),
+            }
+            .publish(&env);
+        }
 
         WatchdogReleaseTriggered {
             escrow_id,
             released_to: released_to.clone(),
-            triggered_by: env.current_contract_address(),
+            triggered_by: keeper,
         }
         .publish(&env);
 
@@ -11398,6 +11440,7 @@ impl EscrowContract {
         env: Env,
         admin: Address,
         default_expiry_seconds: u64,
+        keeper_reward_bps: u32,
     ) -> Result<(), Error> {
         Self::bump_instance_ttl(&env);
         admin.require_auth();
@@ -11406,10 +11449,14 @@ impl EscrowContract {
         if !config.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::NotAnAdmin));
         }
+        if keeper_reward_bps > 10000 {
+            return Err(Error::Basic(BasicError::InvalidBps));
+        }
         env.storage().instance().set(
             &DataKey::Config(ConfigKey::GlobalExpiryConfig),
             &GlobalExpiryConfig {
                 default_expiry_seconds,
+                keeper_reward_bps,
             },
         );
         Ok(())
@@ -11445,6 +11492,7 @@ impl EscrowContract {
     ///
     /// # Arguments
     /// * `env` - Soroban environment.
+    /// * `keeper` - Address of the keeper calling this function (will receive reward).
     /// * `escrow_id` - Identifier for the requested object.
     ///
     /// # Returns
@@ -11452,7 +11500,7 @@ impl EscrowContract {
     ///
     /// # Errors
     /// Returns `Err(Error)` when the operation cannot be completed.
-    pub fn expire_escrow(env: Env, escrow_id: u64) -> Result<(), Error> {
+    pub fn expire_escrow(env: Env, keeper: Address, escrow_id: u64) -> Result<(), Error> {
         Self::bump_instance_ttl(&env);
         Self::require_not_paused(&env, "expire_escrow")?;
         if !env
@@ -11481,17 +11529,52 @@ impl EscrowContract {
             .instance()
             .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
 
-        EscrowContract::transfer_if_token_contract(
-            &env,
-            &escrow.token,
-            &escrow.customer,
-            escrow.amount,
-        )?;
+        // Calculate keeper reward from platform fee
+        let expiry_config = env
+            .storage()
+            .instance()
+            .get::<DataKey, GlobalExpiryConfig>(&DataKey::Config(ConfigKey::GlobalExpiryConfig))
+            .unwrap_or(GlobalExpiryConfig {
+                default_expiry_seconds: 0,
+                keeper_reward_bps: 0,
+            });
+
+        let platform_fee_amount = (escrow.amount * escrow.fee_bps) / 10000;
+        let keeper_reward = if expiry_config.keeper_reward_bps > 0 && platform_fee_amount > 0 {
+            (platform_fee_amount * expiry_config.keeper_reward_bps as i128) / 10000
+        } else {
+            0
+        };
+
+        let customer_refund_amount = escrow.amount - keeper_reward;
+
+        // Transfer refund to customer (minus keeper reward)
+        if customer_refund_amount > 0 {
+            EscrowContract::transfer_if_token_contract(
+                &env,
+                &escrow.token,
+                &escrow.customer,
+                customer_refund_amount,
+            )?;
+        }
+
+        // Transfer keeper reward
+        if keeper_reward > 0 {
+            EscrowContract::transfer_if_token_contract(&env, &escrow.token, &keeper, keeper_reward)?;
+
+            KeeperReward {
+                escrow_id,
+                keeper: keeper.clone(),
+                reward_amount: keeper_reward,
+                trigger_type: String::from_str(&env, "expiry"),
+            }
+            .publish(&env);
+        }
 
         EscrowExpired {
             escrow_id,
             refunded_to: escrow.customer.clone(),
-            amount: escrow.amount,
+            amount: customer_refund_amount,
         }
         .publish(&env);
 
@@ -12021,6 +12104,54 @@ impl EscrowContract {
             return EscrowHealth::Stale;
         }
         EscrowHealth::Healthy
+    }
+
+    /// Query escrows that will expire before the given timestamp.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment.
+    /// * `before_timestamp` - The timestamp to check against (returns escrows expiring before this time).
+    /// * `limit` - Maximum number of escrow IDs to return.
+    ///
+    /// # Returns
+    /// A vector of escrow IDs that have expiry_timestamp set and less than before_timestamp.
+    ///
+    /// # Panics
+    /// Panics if required state is missing.
+    pub fn query_escrows_expiring_before(
+        env: Env,
+        before_timestamp: u64,
+        limit: u32,
+    ) -> Vec<u64> {
+        Self::bump_instance_ttl(&env);
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::Counter))
+            .unwrap_or(0);
+
+        let mut result = Vec::new(&env);
+        let mut id: u64 = 1;
+        while id <= counter && result.len() < limit {
+            if let Some(escrow) = env
+                .storage()
+                .instance()
+                .get::<DataKey, Escrow>(&DataKey::Escrow(EscrowKey::Data(id)))
+            {
+                // Only include escrows that:
+                // 1. Have an expiry timestamp set (not 0)
+                // 2. Are still in Locked status (not already expired/released/cancelled)
+                // 3. Expire before the given timestamp
+                if escrow.expiry_timestamp != 0
+                    && escrow.expiry_timestamp < before_timestamp
+                    && escrow.status == EscrowStatus::Locked
+                {
+                    result.push_back(id);
+                }
+            }
+            id += 1;
+        }
+        result
     }
 
     fn effective_sub_account_fee_bps(sub: &EscrowSubAccount, parent_fee_bps: i128) -> i128 {
