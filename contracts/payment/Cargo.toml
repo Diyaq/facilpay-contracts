@@ -15,5 +15,6 @@ escrow = { path = "../escrow" }
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 escrow = { path = "../escrow" }
+refund = { path = "../refund" }
 ed25519-dalek = { version = "2.1.0", features = ["rand_core"] }
 rand = "0.8.5"

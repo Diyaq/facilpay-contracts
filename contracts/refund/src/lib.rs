@@ -357,6 +357,8 @@ pub enum ExtError {
     // Issue #806: bulk promotional voucher issuance
     EmptyPromotionalBatch = 80,
     PromotionalBatchTooLarge = 81,
+    // Issue #809: refund already mirrored onto the payment contract
+    RefundAlreadySynced = 82,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -441,6 +443,26 @@ pub struct RefundProcessed {
     pub amount: i128,
     pub token: Address,
     pub processed_at: u64,
+}
+
+/// Emitted when a processed refund is recorded on the payment contract (#809).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundPaymentSynced {
+    pub refund_id: u64,
+    pub payment_id: u64,
+    pub amount: i128,
+}
+
+/// Emitted when a processed refund could not be recorded on the payment
+/// contract (#809). `payment_contract_set` is `false` when no payment contract
+/// address is configured, and `true` when the payment contract rejected the call.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundPaymentSyncFailed {
+    pub refund_id: u64,
+    pub payment_id: u64,
+    pub payment_contract_set: bool,
 }
 
 #[contractevent]
@@ -1375,6 +1397,8 @@ pub enum RefundExtKey {
     CounterOffer(u64),
     // Issue #807: per-(merchant, category index) refund percentage cap in bps.
     CategoryRefundCap(Address, u32),
+    // Issue #809: set once a processed refund is recorded on the payment contract.
+    PaymentSynced(u64),
 }
 
 // Issue #807: emitted when a merchant sets a category refund percentage cap.
@@ -6896,10 +6920,116 @@ impl RefundContract {
         })
         .publish(env);
 
+        // Issue #809: mirror the payout onto the payment record. Never reverts
+        // the payout; a failed sync can be retried with `retry_refund_sync`.
+        Self::sync_refund_to_payment(env, refund_id, refund.payment_id, refund.amount);
+
         // Issue #144: Invoke notification hooks
         Self::invoke_hooks(env, RefundEventType::Processed, refund_id);
 
         Ok(())
+    }
+
+    /// Records a processed refund on the payment contract via `record_refund`
+    /// (#809). Returns `true` once the payment contract has accepted it. If no
+    /// payment contract is set or the call fails, emits `RefundPaymentSyncFailed`
+    /// and returns `false` without reverting.
+    fn sync_refund_to_payment(env: &Env, refund_id: u64, payment_id: u64, amount: i128) -> bool {
+        let payment_contract: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaymentContractAddress);
+        let synced = match &payment_contract {
+            Some(payment_contract) => {
+                let args = (
+                    env.current_contract_address(),
+                    payment_id,
+                    refund_id,
+                    amount,
+                )
+                    .into_val(env);
+                matches!(
+                    env.try_invoke_contract::<(), soroban_sdk::InvokeError>(
+                        payment_contract,
+                        &Symbol::new(env, "record_refund"),
+                        args,
+                    ),
+                    Ok(Ok(()))
+                )
+            }
+            None => false,
+        };
+
+        if synced {
+            env.storage()
+                .persistent()
+                .set(&RefundExtKey::PaymentSynced(refund_id), &true);
+            (RefundPaymentSynced {
+                refund_id,
+                payment_id,
+                amount,
+            })
+            .publish(env);
+        } else {
+            (RefundPaymentSyncFailed {
+                refund_id,
+                payment_id,
+                payment_contract_set: payment_contract.is_some(),
+            })
+            .publish(env);
+        }
+        synced
+    }
+
+    /// Retries recording a processed refund on the payment contract (#809).
+    ///
+    /// Anyone may call this; it only pushes an already-processed refund to the
+    /// payment contract, which applies each refund id at most once.
+    ///
+    /// # Arguments
+    /// * `refund_id` - The processed refund to sync.
+    ///
+    /// # Returns
+    /// `true` if the payment contract accepted the update, `false` if it
+    /// rejected it (a `RefundPaymentSyncFailed` event is emitted).
+    ///
+    /// # Errors
+    /// Returns `RefundNotFound` if the refund does not exist, `InvalidStatus` if
+    /// it is not `Processed`, `RefundAlreadySynced` if it was already recorded,
+    /// and `PaymentContractNotSet` if no payment contract address is configured.
+    pub fn retry_refund_sync(env: Env, refund_id: u64) -> Result<bool, Error> {
+        let refund: Refund = env
+            .storage()
+            .instance()
+            .get(&DataKey::Refund(refund_id))
+            .ok_or(Error::Core(CoreError::RefundNotFound))?;
+        if refund.status != RefundStatus::Processed {
+            return Err(Error::Core(CoreError::InvalidStatus));
+        }
+        if Self::is_refund_synced(env.clone(), refund_id) {
+            return Err(Error::Ext(ExtError::RefundAlreadySynced));
+        }
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::PaymentContractAddress)
+        {
+            return Err(Error::Core(CoreError::PaymentContractNotSet));
+        }
+        Ok(Self::sync_refund_to_payment(
+            &env,
+            refund_id,
+            refund.payment_id,
+            refund.amount,
+        ))
+    }
+
+    /// Returns whether a processed refund has been recorded on the payment
+    /// contract (#809).
+    pub fn is_refund_synced(env: Env, refund_id: u64) -> bool {
+        env.storage()
+            .persistent()
+            .has(&RefundExtKey::PaymentSynced(refund_id))
     }
 
     fn get_external_payment(env: &Env, payment_id: u64) -> Result<ExternalPayment, Error> {
@@ -11279,3 +11409,6 @@ mod test_upgrade;
 
 #[cfg(test)]
 mod test_refund_reserve;
+
+#[cfg(test)]
+mod test_payment_sync;

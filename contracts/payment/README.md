@@ -585,6 +585,53 @@ A mandate lets a customer authorize a merchant to charge variable amounts, witho
 | `MandateCharged` | `mandate_id`, `customer`, `merchant`, `amount`, `memo`, `total_charged`, `period_charged` | `charge_mandate` |
 | `MandateRevoked` | `mandate_id`, `customer`, `merchant` | `revoke_mandate` |
 
+### Refund Sync from the Refund Contract (Issue #809)
+
+When the refund contract pays out a refund, it calls `record_refund` here so the payment record shows the refund instead of staying `Completed`. Only the refund contract registered with `set_refund_contract` can call it.
+
+| Function | Description |
+| --- | --- |
+| `set_refund_contract(admin, refund_contract)` | The contract admin (must authorize) registers the refund contract allowed to call `record_refund`. Calling it again replaces the address. |
+| `get_refund_contract()` | Returns the registered refund contract, or `None`. |
+| `record_refund(refund_contract, payment_id, refund_id, amount)` | Called by the registered refund contract after it processes a refund. Adds `amount` to the payment's `refunded_amount` and updates its status. |
+
+#### Parameters
+
+| Parameter | Type | Rule |
+| --- | --- | --- |
+| `admin` | `Address` | Must authorize and be the contract admin. |
+| `refund_contract` | `Address` | For `record_refund`: must be the registered refund contract and must authorize. A contract calling directly authorizes its own address automatically. |
+| `payment_id` | `u64` | The payment the refund belongs to. |
+| `refund_id` | `u64` | The refund contract's refund ID. Each refund ID is applied at most once. |
+| `amount` | `i128` | The refunded amount, `> 0`. |
+
+#### Behaviour
+
+- Allowed only on `Completed` and `PartialRefunded` payments.
+- The payment becomes `PartialRefunded`, or `Refunded` once `refunded_amount` equals `amount`. A status change is added to the payment's status history (see `get_payment_status_history`). The `actor` on that entry is the refund contract.
+- No tokens move. The refund contract has already paid the customer, so tips, analytics buckets and spend limits are left unchanged.
+- Respects the contract pause and `pause_function("record_refund")`. While either pause is on, the call fails. The refund contract reports the failure and can retry the sync later.
+
+#### Errors
+
+| Error | Code | When |
+| --- | --- | --- |
+| `BasicError::Unauthorized` | `100` | `set_refund_contract`: caller is not the admin. `record_refund`: caller is not the registered refund contract |
+| `BasicError::ContractPaused` / `FunctionPaused` | `116` / `117` | `record_refund`: the contract or the function is paused |
+| `BasicError::InvalidAmount` | `121` | `amount <= 0` |
+| `PaymentError::NotFound` | `200` | No payment with this ID |
+| `PaymentError::InvalidStatus` | `201` | The payment is `Pending` or `Cancelled` |
+| `PaymentError::AlreadyProcessed` | `202` | `refund_id` was already recorded, or the payment is already `Refunded` |
+| `PaymentError::RefundExceedsPayment` | `207` | `refunded_amount + amount` would exceed the payment amount |
+| `PaymentError::RefundContractNotSet` | `244` | No refund contract is registered |
+
+#### Events
+
+| Event | Fields | Emitted by |
+| --- | --- | --- |
+| `RefundContractSet` | `refund_contract`, `set_by` | `set_refund_contract` |
+| `PaymentRefundSynced` | `payment_id`, `refund_id`, `amount`, `refunded_amount`, `status` | `record_refund` |
+
 ### Dunning (Failed Payment Recovery)
 
 | Function                                           | Description                                                                              |
@@ -1421,7 +1468,7 @@ Errors are grouped into five ranges:
 | Range   | Category                                                       |
 | ------- | -------------------------------------------------------------- |
 | 100–126 | `BasicError` — auth, metadata, rate limits, multi-sig setup    |
-| 200–243 | `PaymentError` — payment lifecycle, payment-request and merchant-registry violations |
+| 200–244 | `PaymentError` — payment lifecycle, payment-request, merchant-registry and refund-sync violations |
 | 300–320 | `SubscriptionError` — subscription, dunning, skip-cap and pause-limit violations |
 | 400–406 | `ProposalError` — multi-sig proposal violations                |
 | 500–545 | `FeatureError` — channels, splits, loyalty, escrow, forwarding |
