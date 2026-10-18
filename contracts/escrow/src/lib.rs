@@ -214,6 +214,7 @@ pub enum EscrowError {
     MilestoneAlreadyClaimed = 232,
     InvalidBeneficiaryShares = 233,
     DuplicateBeneficiary = 234,
+    DisputeCooldownActive = 235,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -245,6 +246,7 @@ pub enum ActionError {
     HookNotOwnedBySubscriber = 320,
     MaxHooksPerEventReached = 321,
     InvalidHookAddress = 322,
+    ReleaseDelegateNotSet = 323,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -291,12 +293,12 @@ impl TryFrom<soroban_sdk::Error> for Error {
     fn try_from(error: soroban_sdk::Error) -> Result<Self, Self::Error> {
         if error.is_type(soroban_sdk::xdr::ScErrorType::Contract) {
             let code = error.get_code();
-            if (300..=322).contains(&code) {
+            if (300..=323).contains(&code) {
                 return Ok(Error::Action(unsafe {
                     core::mem::transmute::<u32, ActionError>(code)
                 }));
             }
-            if (200..=234).contains(&code) {
+            if (200..=235).contains(&code) {
                 return Ok(Error::Escrow(unsafe {
                     core::mem::transmute::<u32, EscrowError>(code)
                 }));
@@ -603,6 +605,37 @@ pub struct CollateralReturned {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeFeeCharged {
+    pub escrow_id: u64,
+    pub losing_party: Address,
+    pub fee_amount: i128,
+    pub token: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReleaseDelegateSet {
+    pub escrow_id: u64,
+    pub delegate: Address,
+    pub set_by: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReleaseDelegateRemoved {
+    pub escrow_id: u64,
+    pub removed_by: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DelegatedReleaseApproved {
+    pub escrow_id: u64,
+    pub approved_by: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EscrowCreated {
     pub escrow_id: u64,
     pub customer: Address,
@@ -850,6 +883,8 @@ pub struct DisputeConfig {
     pub collateral_amount: i128,
     pub collateral_enabled: bool,
     pub min_collateral_ratio_bps: u32,
+    pub dispute_fee_bps: u32,           // Fee charged to losing party in basis points
+    pub dispute_cooldown_seconds: u64,  // Cooldown period before re-disputing after withdrawal
 }
 
 #[derive(Clone)]
@@ -1071,8 +1106,10 @@ pub struct Escrow {
     pub escalated_at: Option<u64>,
     pub escalation_timeout: u64,
     pub auto_resolve_in_favor_of: AutoResolveFavor,
-    pub evidence_deadline: Option<u64>, // Deadline for evidence submission in dispute
-    pub released_amount: i128,          // Issue #687: cumulative amount already partially released
+    pub evidence_deadline: Option<u64>,       // Deadline for evidence submission in dispute
+    pub released_amount: i128,                // Issue #687: cumulative amount already partially released
+    pub release_delegate: Option<Address>,    // Address delegated to approve release
+    pub last_dispute_withdrawn_at: Option<u64>, // Timestamp of last dispute withdrawal for cooldown
 }
 
 #[derive(Clone)]
@@ -3347,6 +3384,8 @@ impl EscrowContract {
             auto_resolve_in_favor_of: escalation_cfg.favor,
             evidence_deadline: None,
             released_amount: 0,
+            release_delegate: None,
+            last_dispute_withdrawn_at: None,
         };
 
         env.storage()
@@ -4745,6 +4784,170 @@ impl EscrowContract {
         Ok(())
     }
 
+    /// Sets a delegate address who can approve release of the escrow.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment.
+    /// * `caller` - Address of the merchant (must be the merchant of the escrow).
+    /// * `escrow_id` - Identifier for the escrow.
+    /// * `delegate` - Address of the delegate who can approve release.
+    ///
+    /// # Returns
+    /// Results in `Ok(())` on success or `Err(Error)` on failure.
+    ///
+    /// # Errors
+    /// Returns `Err(Error)` when the operation cannot be completed.
+    pub fn set_release_delegate(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+        delegate: Address,
+    ) -> Result<(), Error> {
+        Self::bump_instance_ttl(&env);
+        caller.require_auth();
+        Self::require_not_paused(&env, "set_release_delegate")?;
+
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+
+        let mut escrow = EscrowContract::get_escrow(&env, escrow_id);
+
+        // Only merchant can set a delegate
+        if caller != escrow.merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        // Cannot set delegate on already released/resolved escrows
+        if escrow.status != EscrowStatus::Locked && escrow.status != EscrowStatus::Disputed {
+            return Err(Error::Escrow(EscrowError::InvalidStatus));
+        }
+
+        escrow.release_delegate = Some(delegate.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
+
+        ReleaseDelegateSet {
+            escrow_id,
+            delegate,
+            set_by: caller,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Removes the release delegate from an escrow.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment.
+    /// * `caller` - Address of the merchant (must be the merchant of the escrow).
+    /// * `escrow_id` - Identifier for the escrow.
+    ///
+    /// # Returns
+    /// Results in `Ok(())` on success or `Err(Error)` on failure.
+    ///
+    /// # Errors
+    /// Returns `Err(Error)` when the operation cannot be completed.
+    pub fn remove_release_delegate(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+    ) -> Result<(), Error> {
+        Self::bump_instance_ttl(&env);
+        caller.require_auth();
+        Self::require_not_paused(&env, "remove_release_delegate")?;
+
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+
+        let mut escrow = EscrowContract::get_escrow(&env, escrow_id);
+
+        // Only merchant can remove their delegate
+        if caller != escrow.merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        escrow.release_delegate = None;
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
+
+        ReleaseDelegateRemoved {
+            escrow_id,
+            removed_by: caller,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Approves the release of escrow funds by a delegated address.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment.
+    /// * `caller` - Address of the delegate.
+    /// * `escrow_id` - Identifier for the escrow.
+    ///
+    /// # Returns
+    /// Results in `Ok(())` on success or `Err(Error)` on failure.
+    ///
+    /// # Errors
+    /// Returns `Err(Error)` when the operation cannot be completed.
+    pub fn approve_release_as_delegate(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+    ) -> Result<(), Error> {
+        Self::bump_instance_ttl(&env);
+        caller.require_auth();
+        Self::require_not_paused(&env, "approve_release_as_delegate")?;
+
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+
+        let escrow = EscrowContract::get_escrow(&env, escrow_id);
+
+        // Check if delegate is set
+        let delegate = escrow
+            .release_delegate
+            .ok_or(Error::Action(ActionError::ReleaseDelegateNotSet))?;
+
+        // Only the delegate can approve
+        if caller != delegate {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        // Cannot approve if not in Locked status
+        if escrow.status != EscrowStatus::Locked {
+            return Err(Error::Escrow(EscrowError::InvalidStatus));
+        }
+
+        DelegatedReleaseApproved {
+            escrow_id,
+            approved_by: caller,
+        }
+        .publish(&env);
+
+        // Proceed with the release (acting as admin)
+        Self::internal_release_escrow(env, delegate, escrow_id, false, None)
+    }
+
     /// Files or manages a dispute for an escrow.
     ///
     /// # Arguments
@@ -4778,8 +4981,17 @@ impl EscrowContract {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
 
-        // Handle collateral
+        // Check cooldown period after dispute withdrawal
         let config = Self::get_dispute_config(env.clone());
+        if let Some(last_withdrawn_at) = escrow.last_dispute_withdrawn_at {
+            let current_time = env.ledger().timestamp();
+            let cooldown_end = last_withdrawn_at + config.dispute_cooldown_seconds;
+            if current_time < cooldown_end {
+                return Err(Error::Escrow(EscrowError::DisputeCooldownActive));
+            }
+        }
+
+        // Handle collateral
         if config.collateral_enabled && config.collateral_amount > 0 {
             // Validate collateral-to-loan ratio
             // Formula: collateral_amount * 10000 >= escrow_amount * min_collateral_ratio_bps
@@ -5124,6 +5336,7 @@ impl EscrowContract {
         escrow.escalated_at = None;
         escrow.escalation_level = 0;
         escrow.last_activity_at = env.ledger().timestamp();
+        escrow.last_dispute_withdrawn_at = Some(env.ledger().timestamp());
         env.storage()
             .instance()
             .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
@@ -6008,6 +6221,44 @@ impl EscrowContract {
         );
 
         Self::dequeue_escalation(&env, escrow_id);
+
+        // Charge dispute fee to the losing party
+        let dispute_config = Self::get_dispute_config(env.clone());
+        let loser = if release_to_merchant {
+            &escrow.customer
+        } else {
+            &escrow.merchant
+        };
+        
+        if dispute_config.dispute_fee_bps > 0 {
+            let dispute_fee = (escrow.amount * dispute_config.dispute_fee_bps as i128) / 10000;
+            if dispute_fee > 0 {
+                let token_client = token::Client::new(&env, &escrow.token);
+                token_client.transfer(
+                    loser,
+                    env.current_contract_address(),
+                    &dispute_fee,
+                );
+
+                // Transfer fee to the contract's fee recipient or admin
+                let fee_config = Self::effective_fee_config(&env, &escrow.token);
+                if fee_config.enabled {
+                    token_client.transfer(
+                        &env.current_contract_address(),
+                        &fee_config.fee_recipient,
+                        &dispute_fee,
+                    );
+                }
+
+                DisputeFeeCharged {
+                    escrow_id,
+                    losing_party: loser.clone(),
+                    fee_amount: dispute_fee,
+                    token: escrow.token.clone(),
+                }
+                .publish(&env);
+            }
+        }
 
         // Transfer main escrow funds
         let recipient = if release_to_merchant {
@@ -10123,6 +10374,8 @@ impl EscrowContract {
                 collateral_amount: 0,
                 collateral_enabled: false,
                 min_collateral_ratio_bps: 15000, // Default 150%
+                dispute_fee_bps: 0,               // Default 0% - no dispute fee
+                dispute_cooldown_seconds: 0,      // Default 0 - no cooldown
             })
     }
 
