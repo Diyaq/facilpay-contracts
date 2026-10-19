@@ -1818,6 +1818,12 @@ pub const INSTANCE_BUMP_THRESHOLD: u32 = 30 * LEDGERS_PER_DAY;
 /// survives long quiet periods without being archived (#646).
 pub const INSTANCE_BUMP_AMOUNT: u32 = 90 * LEDGERS_PER_DAY;
 
+// Issue #649: Persistent storage TTL constants for per-record and per-user data
+#[allow(dead_code)]
+const PERSISTENT_TTL_THRESHOLD: u32 = 30 * LEDGERS_PER_DAY;
+#[allow(dead_code)]
+const PERSISTENT_TTL_EXTEND_TO: u32 = 90 * LEDGERS_PER_DAY;
+
 #[contract]
 pub struct EscrowContract;
 
