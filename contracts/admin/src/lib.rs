@@ -186,6 +186,34 @@ pub struct EmergencyPauseAutoExpired {
     pub unpaused_at: u64,
 }
 
+/// Emitted when the entire platform is paused (#651).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlatformPaused {
+    pub paused_by: Address,
+    pub reason: String,
+    pub paused_at: u64,
+    pub expires_at: Option<u64>,
+}
+
+/// Emitted when the entire platform is unpaused (#651).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlatformUnpaused {
+    pub unpaused_by: Address,
+    pub unpaused_at: u64,
+}
+
+/// Emitted when a child contract address is updated (#651).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChildContractUpdated {
+    pub child_kind: ChildKind,
+    pub new_address: Address,
+    pub updated_by: Address,
+    pub updated_at: u64,
+}
+
 /// Verifies `pauser` is authenticated and matches the stored pauser.
 fn require_pauser(env: &Env, pauser: &Address) -> Result<(), Error> {
     pauser.require_auth();
@@ -500,6 +528,14 @@ impl AdminContract {
                 .remove(&DataKey::EmergencyPauseExpiry),
         }
 
+        PlatformPaused {
+            paused_by: pauser,
+            reason,
+            paused_at: env.ledger().timestamp(),
+            expires_at,
+        }
+        .publish(&env);
+
         Ok(())
     }
 
@@ -521,6 +557,13 @@ impl AdminContract {
         env.storage()
             .instance()
             .remove(&DataKey::EmergencyPauseExpiry);
+
+        PlatformUnpaused {
+            unpaused_by: pauser,
+            unpaused_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
+
         Ok(())
     }
 
@@ -751,7 +794,15 @@ impl AdminContract {
 
         env.storage()
             .instance()
-            .set(&DataKey::PaymentContract, &payment_contract);
+            .set(&DataKey::PaymentContract, &payment_contract.clone());
+
+        ChildContractUpdated {
+            child_kind: ChildKind::Payment,
+            new_address: payment_contract,
+            updated_by: admin,
+            updated_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -775,7 +826,15 @@ impl AdminContract {
 
         env.storage()
             .instance()
-            .set(&DataKey::EscrowContract, &escrow_contract);
+            .set(&DataKey::EscrowContract, &escrow_contract.clone());
+
+        ChildContractUpdated {
+            child_kind: ChildKind::Escrow,
+            new_address: escrow_contract,
+            updated_by: admin,
+            updated_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -799,7 +858,15 @@ impl AdminContract {
 
         env.storage()
             .instance()
-            .set(&DataKey::RefundContract, &refund_contract);
+            .set(&DataKey::RefundContract, &refund_contract.clone());
+
+        ChildContractUpdated {
+            child_kind: ChildKind::Refund,
+            new_address: refund_contract,
+            updated_by: admin,
+            updated_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
 
         Ok(())
     }
