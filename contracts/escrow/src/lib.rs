@@ -127,6 +127,12 @@ pub enum DisputeKey {
     EscalationDeadline(u64),
     AppealRecord(u64, u64),
     DisputeOpener(u64),
+    // Milestone amendment feature
+    MilestoneAmendment(u64, u64), // (escrow_id, milestone_id)
+    MilestoneAmendmentCounter,
+    // Settlement offer feature
+    SettlementOffer(u64), // keyed by escrow_id
+    SettlementOfferCounter,
 }
 
 // Issue #686: storage keys for escrow lifecycle notification hooks
@@ -245,6 +251,18 @@ pub enum ActionError {
     HookNotOwnedBySubscriber = 320,
     MaxHooksPerEventReached = 321,
     InvalidHookAddress = 322,
+    // Milestone amendment feature
+    MilestoneAmendmentNotFound = 323,
+    MilestoneAmendmentAlreadyExists = 324,
+    MilestoneNotFound = 325,
+    MilestoneAmendmentAlreadyAccepted = 326,
+    // Settlement offer feature
+    SettlementOfferNotFound = 327,
+    SettlementOfferAlreadyExists = 328,
+    SettlementOfferExpired = 329,
+    SettlementOfferAlreadyAccepted = 330,
+    SettlementOfferAlreadyRejected = 331,
+    InvalidSettlementAmount = 332,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -291,7 +309,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
     fn try_from(error: soroban_sdk::Error) -> Result<Self, Self::Error> {
         if error.is_type(soroban_sdk::xdr::ScErrorType::Contract) {
             let code = error.get_code();
-            if (300..=322).contains(&code) {
+            if (300..=332).contains(&code) {
                 return Ok(Error::Action(unsafe {
                     core::mem::transmute::<u32, ActionError>(code)
                 }));
@@ -989,6 +1007,68 @@ pub struct MilestoneApproved {
     pub approved_by: Address,
 }
 
+// Milestone amendment events
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MilestoneAmendmentProposed {
+    pub escrow_id: u64,
+    pub milestone_id: u64,
+    pub proposed_by: Address,
+    pub new_amount: i128,
+    pub new_deadline: Option<u64>,
+    pub proposed_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MilestoneAmendmentAccepted {
+    pub escrow_id: u64,
+    pub milestone_id: u64,
+    pub accepted_by: Address,
+    pub new_amount: i128,
+    pub new_deadline: Option<u64>,
+    pub accepted_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MilestoneAmendmentRejected {
+    pub escrow_id: u64,
+    pub milestone_id: u64,
+    pub rejected_by: Address,
+    pub rejected_at: u64,
+}
+
+// Settlement offer events
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SettlementOfferProposed {
+    pub escrow_id: u64,
+    pub proposed_by: Address,
+    pub customer_amount: i128,
+    pub merchant_amount: i128,
+    pub proposed_at: u64,
+    pub expires_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SettlementOfferAccepted {
+    pub escrow_id: u64,
+    pub accepted_by: Address,
+    pub customer_amount: i128,
+    pub merchant_amount: i128,
+    pub accepted_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SettlementOfferRejected {
+    pub escrow_id: u64,
+    pub rejected_by: Address,
+    pub rejected_at: u64,
+}
+
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WatchdogReleaseTriggered {
@@ -1193,6 +1273,36 @@ pub struct VestingSchedule {
     pub cliff_timestamp: u64,
     pub end_timestamp: u64,
     pub milestones: Vec<VestingMilestone>,
+}
+
+/// Proposed amendment to a milestone by either party
+#[derive(Clone)]
+#[contracttype]
+pub struct MilestoneAmendment {
+    pub escrow_id: u64,
+    pub milestone_id: u64,
+    pub proposed_by: Address,
+    pub new_amount: i128,
+    pub new_unlock_timestamp: u64,
+    pub new_deadline: Option<u64>,
+    pub new_description: String,
+    pub proposed_at: u64,
+    pub accepted: bool,
+    pub rejected: bool,
+}
+
+/// Settlement offer proposed during a dispute
+#[derive(Clone)]
+#[contracttype]
+pub struct SettlementOffer {
+    pub escrow_id: u64,
+    pub proposed_by: Address,
+    pub customer_amount: i128,
+    pub merchant_amount: i128,
+    pub proposed_at: u64,
+    pub expires_at: u64,
+    pub accepted: bool,
+    pub rejected: bool,
 }
 
 #[derive(Clone)]
@@ -8208,6 +8318,495 @@ impl EscrowContract {
             &DataKey::Escrow(EscrowKey::VestingSchedule(escrow_id)),
             &vesting_schedule,
         );
+
+        Ok(())
+    }
+
+    /// Propose an amendment to an existing milestone.
+    /// Can be proposed by either the customer or merchant.
+    ///
+    /// # Arguments
+    /// * `caller` - The party proposing the amendment (customer or merchant)
+    /// * `escrow_id` - ID of the escrow containing the milestone
+    /// * `milestone_id` - ID of the milestone to amend
+    /// * `new_amount` - Proposed new amount for the milestone
+    /// * `new_unlock_timestamp` - Proposed new unlock timestamp
+    /// * `new_deadline` - Proposed new deadline (optional)
+    /// * `new_description` - Proposed new description
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    ///
+    /// # Errors
+    /// * `EscrowError::NotFound` - Escrow or milestone not found
+    /// * `ActionError::MilestoneAmendmentAlreadyExists` - Amendment already pending
+    /// * `BasicError::Unauthorized` - Caller is not customer or merchant
+    pub fn propose_milestone_amendment(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+        milestone_id: u64,
+        new_amount: i128,
+        new_unlock_timestamp: u64,
+        new_deadline: Option<u64>,
+        new_description: String,
+    ) -> Result<(), Error> {
+        Self::bump_instance_ttl(&env);
+        caller.require_auth();
+        Self::require_not_paused(&env, "propose_milestone_amendment")?;
+
+        // Verify escrow exists
+        let escrow = Self::get_escrow(&env, escrow_id);
+        
+        // Verify caller is either customer or merchant
+        if caller != escrow.customer && caller != escrow.merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        // Verify milestone exists
+        let vesting_schedule = env
+            .storage()
+            .instance()
+            .get::<DataKey, VestingSchedule>(&DataKey::Escrow(EscrowKey::VestingSchedule(
+                escrow_id,
+            )))
+            .ok_or(Error::Escrow(EscrowError::NotFound))?;
+
+        let milestone_exists = vesting_schedule
+            .milestones
+            .iter()
+            .any(|m| m.milestone_id == milestone_id);
+
+        if !milestone_exists {
+            return Err(Error::Action(ActionError::MilestoneNotFound));
+        }
+
+        // Check if amendment already exists
+        let amendment_key = DataKey::Dispute(DisputeKey::MilestoneAmendment(escrow_id, milestone_id));
+        if env.storage().instance().has(&amendment_key) {
+            return Err(Error::Action(ActionError::MilestoneAmendmentAlreadyExists));
+        }
+
+        // Create amendment proposal
+        let amendment = MilestoneAmendment {
+            escrow_id,
+            milestone_id,
+            proposed_by: caller.clone(),
+            new_amount,
+            new_unlock_timestamp,
+            new_deadline: new_deadline.clone(),
+            new_description: new_description.clone(),
+            proposed_at: env.ledger().timestamp(),
+            accepted: false,
+            rejected: false,
+        };
+
+        env.storage().instance().set(&amendment_key, &amendment);
+
+        // Emit event
+        MilestoneAmendmentProposed {
+            escrow_id,
+            milestone_id,
+            proposed_by: caller,
+            new_amount,
+            new_deadline,
+            proposed_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Accept a proposed milestone amendment.
+    /// Must be called by the other party (not the proposer).
+    ///
+    /// # Arguments
+    /// * `caller` - The party accepting the amendment
+    /// * `escrow_id` - ID of the escrow containing the milestone
+    /// * `milestone_id` - ID of the milestone being amended
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    ///
+    /// # Errors
+    /// * `ActionError::MilestoneAmendmentNotFound` - No amendment proposal exists
+    /// * `ActionError::MilestoneAmendmentAlreadyAccepted` - Amendment already accepted
+    /// * `BasicError::Unauthorized` - Caller is not the counterparty
+    pub fn accept_milestone_amendment(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+        milestone_id: u64,
+    ) -> Result<(), Error> {
+        Self::bump_instance_ttl(&env);
+        caller.require_auth();
+        Self::require_not_paused(&env, "accept_milestone_amendment")?;
+
+        let escrow = Self::get_escrow(&env, escrow_id);
+
+        // Verify caller is the counterparty (not the proposer)
+        let amendment_key = DataKey::Dispute(DisputeKey::MilestoneAmendment(escrow_id, milestone_id));
+        let mut amendment: MilestoneAmendment = env
+            .storage()
+            .instance()
+            .get(&amendment_key)
+            .ok_or(Error::Action(ActionError::MilestoneAmendmentNotFound))?;
+
+        if amendment.accepted {
+            return Err(Error::Action(ActionError::MilestoneAmendmentAlreadyAccepted));
+        }
+
+        // Caller must be the other party (not the proposer)
+        if caller == amendment.proposed_by {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        if caller != escrow.customer && caller != escrow.merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        // Mark as accepted
+        amendment.accepted = true;
+        env.storage().instance().set(&amendment_key, &amendment);
+
+        // Update the actual milestone in the vesting schedule
+        let mut vesting_schedule: VestingSchedule = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::VestingSchedule(escrow_id)))
+            .ok_or(Error::Escrow(EscrowError::NotFound))?;
+
+        for i in 0..vesting_schedule.milestones.len() {
+            let mut milestone = vesting_schedule.milestones.get(i).unwrap();
+            if milestone.milestone_id == milestone_id {
+                milestone.amount = amendment.new_amount;
+                milestone.unlock_timestamp = amendment.new_unlock_timestamp;
+                milestone.deadline = amendment.new_deadline.clone();
+                milestone.description = amendment.new_description.clone();
+                vesting_schedule.milestones.set(i, milestone);
+                break;
+            }
+        }
+
+        env.storage().instance().set(
+            &DataKey::Escrow(EscrowKey::VestingSchedule(escrow_id)),
+            &vesting_schedule,
+        );
+
+        // Emit event
+        MilestoneAmendmentAccepted {
+            escrow_id,
+            milestone_id,
+            accepted_by: caller,
+            new_amount: amendment.new_amount,
+            new_deadline: amendment.new_deadline,
+            accepted_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Reject a proposed milestone amendment.
+    /// Must be called by the other party (not the proposer).
+    ///
+    /// # Arguments
+    /// * `caller` - The party rejecting the amendment
+    /// * `escrow_id` - ID of the escrow containing the milestone
+    /// * `milestone_id` - ID of the milestone being amended
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    ///
+    /// # Errors
+    /// * `ActionError::MilestoneAmendmentNotFound` - No amendment proposal exists
+    /// * `BasicError::Unauthorized` - Caller is not the counterparty
+    pub fn reject_milestone_amendment(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+        milestone_id: u64,
+    ) -> Result<(), Error> {
+        Self::bump_instance_ttl(&env);
+        caller.require_auth();
+        Self::require_not_paused(&env, "reject_milestone_amendment")?;
+
+        let escrow = Self::get_escrow(&env, escrow_id);
+
+        let amendment_key = DataKey::Dispute(DisputeKey::MilestoneAmendment(escrow_id, milestone_id));
+        let mut amendment: MilestoneAmendment = env
+            .storage()
+            .instance()
+            .get(&amendment_key)
+            .ok_or(Error::Action(ActionError::MilestoneAmendmentNotFound))?;
+
+        // Caller must be the other party (not the proposer)
+        if caller == amendment.proposed_by {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        if caller != escrow.customer && caller != escrow.merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        // Mark as rejected and remove
+        amendment.rejected = true;
+        env.storage().instance().remove(&amendment_key);
+
+        // Emit event
+        MilestoneAmendmentRejected {
+            escrow_id,
+            milestone_id,
+            rejected_by: caller,
+            rejected_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Propose a settlement offer during a dispute.
+    /// Can be proposed by either the customer or merchant when escrow is disputed.
+    ///
+    /// # Arguments
+    /// * `caller` - The party proposing the settlement
+    /// * `escrow_id` - ID of the disputed escrow
+    /// * `customer_amount` - Amount to be sent to customer
+    /// * `merchant_amount` - Amount to be sent to merchant
+    /// * `expiry_seconds` - Seconds until the offer expires
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    ///
+    /// # Errors
+    /// * `EscrowError::NotFound` - Escrow not found
+    /// * `ActionError::NotDisputed` - Escrow is not in disputed status
+    /// * `ActionError::SettlementOfferAlreadyExists` - Settlement offer already pending
+    /// * `ActionError::InvalidSettlementAmount` - Amounts don't match escrow amount
+    /// * `BasicError::Unauthorized` - Caller is not customer or merchant
+    pub fn propose_settlement_offer(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+        customer_amount: i128,
+        merchant_amount: i128,
+        expiry_seconds: u64,
+    ) -> Result<(), Error> {
+        Self::bump_instance_ttl(&env);
+        caller.require_auth();
+        Self::require_not_paused(&env, "propose_settlement_offer")?;
+
+        // Verify escrow exists and is disputed
+        let escrow = Self::get_escrow(&env, escrow_id);
+        
+        if escrow.status != EscrowStatus::Disputed {
+            return Err(Error::Action(ActionError::NotDisputed));
+        }
+
+        // Verify caller is either customer or merchant
+        if caller != escrow.customer && caller != escrow.merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        // Verify amounts sum to escrow amount (accounting for fees)
+        let total_offer = customer_amount + merchant_amount;
+        if total_offer != escrow.amount {
+            return Err(Error::Action(ActionError::InvalidSettlementAmount));
+        }
+
+        // Check if settlement offer already exists
+        let offer_key = DataKey::Dispute(DisputeKey::SettlementOffer(escrow_id));
+        if env.storage().instance().has(&offer_key) {
+            // Check if existing offer is expired
+            let existing_offer: SettlementOffer = env.storage().instance().get(&offer_key).unwrap();
+            if env.ledger().timestamp() < existing_offer.expires_at && !existing_offer.rejected {
+                return Err(Error::Action(ActionError::SettlementOfferAlreadyExists));
+            }
+        }
+
+        let current_time = env.ledger().timestamp();
+        let offer = SettlementOffer {
+            escrow_id,
+            proposed_by: caller.clone(),
+            customer_amount,
+            merchant_amount,
+            proposed_at: current_time,
+            expires_at: current_time + expiry_seconds,
+            accepted: false,
+            rejected: false,
+        };
+
+        env.storage().instance().set(&offer_key, &offer);
+
+        // Emit event
+        SettlementOfferProposed {
+            escrow_id,
+            proposed_by: caller,
+            customer_amount,
+            merchant_amount,
+            proposed_at: current_time,
+            expires_at: current_time + expiry_seconds,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Accept a settlement offer and resolve the dispute.
+    /// Must be called by the other party (not the proposer).
+    ///
+    /// # Arguments
+    /// * `caller` - The party accepting the settlement
+    /// * `escrow_id` - ID of the disputed escrow
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    ///
+    /// # Errors
+    /// * `ActionError::SettlementOfferNotFound` - No settlement offer exists
+    /// * `ActionError::SettlementOfferExpired` - Offer has expired
+    /// * `ActionError::SettlementOfferAlreadyAccepted` - Offer already accepted
+    /// * `BasicError::Unauthorized` - Caller is not the counterparty
+    pub fn accept_settlement_offer(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+    ) -> Result<(), Error> {
+        Self::bump_instance_ttl(&env);
+        caller.require_auth();
+        Self::require_not_paused(&env, "accept_settlement_offer")?;
+
+        let mut escrow = Self::get_escrow(&env, escrow_id);
+
+        if escrow.status != EscrowStatus::Disputed {
+            return Err(Error::Action(ActionError::NotDisputed));
+        }
+
+        let offer_key = DataKey::Dispute(DisputeKey::SettlementOffer(escrow_id));
+        let mut offer: SettlementOffer = env
+            .storage()
+            .instance()
+            .get(&offer_key)
+            .ok_or(Error::Action(ActionError::SettlementOfferNotFound))?;
+
+        // Check if offer is expired
+        if env.ledger().timestamp() >= offer.expires_at {
+            return Err(Error::Action(ActionError::SettlementOfferExpired));
+        }
+
+        if offer.accepted {
+            return Err(Error::Action(ActionError::SettlementOfferAlreadyAccepted));
+        }
+
+        // Caller must be the other party (not the proposer)
+        if caller == offer.proposed_by {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        if caller != escrow.customer && caller != escrow.merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        // Mark offer as accepted
+        offer.accepted = true;
+        env.storage().instance().set(&offer_key, &offer);
+
+        // Resolve the dispute by distributing funds according to settlement
+        escrow.status = EscrowStatus::Resolved;
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
+
+        // Transfer funds according to settlement
+        if offer.customer_amount > 0 {
+            Self::transfer_if_token_contract(
+                &env,
+                &escrow.token,
+                &escrow.customer,
+                offer.customer_amount,
+            )?;
+        }
+
+        if offer.merchant_amount > 0 {
+            Self::transfer_if_token_contract(
+                &env,
+                &escrow.token,
+                &escrow.merchant,
+                offer.merchant_amount,
+            )?;
+        }
+
+        // Emit events
+        SettlementOfferAccepted {
+            escrow_id,
+            accepted_by: caller,
+            customer_amount: offer.customer_amount,
+            merchant_amount: offer.merchant_amount,
+            accepted_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
+
+        EscrowResolved {
+            escrow_id,
+            released_to_merchant: offer.merchant_amount > offer.customer_amount,
+            amount: escrow.amount,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Reject a settlement offer.
+    /// Must be called by the other party (not the proposer).
+    ///
+    /// # Arguments
+    /// * `caller` - The party rejecting the settlement
+    /// * `escrow_id` - ID of the disputed escrow
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    ///
+    /// # Errors
+    /// * `ActionError::SettlementOfferNotFound` - No settlement offer exists
+    /// * `BasicError::Unauthorized` - Caller is not the counterparty
+    pub fn reject_settlement_offer(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+    ) -> Result<(), Error> {
+        Self::bump_instance_ttl(&env);
+        caller.require_auth();
+        Self::require_not_paused(&env, "reject_settlement_offer")?;
+
+        let escrow = Self::get_escrow(&env, escrow_id);
+
+        let offer_key = DataKey::Dispute(DisputeKey::SettlementOffer(escrow_id));
+        let mut offer: SettlementOffer = env
+            .storage()
+            .instance()
+            .get(&offer_key)
+            .ok_or(Error::Action(ActionError::SettlementOfferNotFound))?;
+
+        // Caller must be the other party (not the proposer)
+        if caller == offer.proposed_by {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        if caller != escrow.customer && caller != escrow.merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        // Mark as rejected and remove
+        offer.rejected = true;
+        env.storage().instance().remove(&offer_key);
+
+        // Emit event
+        SettlementOfferRejected {
+            escrow_id,
+            rejected_by: caller,
+            rejected_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
 
         Ok(())
     }

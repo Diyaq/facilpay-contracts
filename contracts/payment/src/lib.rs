@@ -81,6 +81,10 @@ pub enum PaymentKey {
     // Issue #662: merchant-initiated payment requests
     RequestCounter,
     Request(u64),
+    // Reusable payment links feature
+    PaymentLinkCounter,
+    PaymentLink(u64),
+    PaymentLinkUsage(u64), // Tracks current usage count for a link
 }
 
 pub const MAX_MEMO_VERSIONS: u32 = 10;
@@ -234,6 +238,12 @@ pub enum PaymentError {
     MerchantNotRegistered = 241,
     MerchantInactive = 242,
     InvalidMerchantName = 243,
+    // Reusable payment links feature
+    PaymentLinkNotFound = 244,
+    PaymentLinkExpired = 245,
+    PaymentLinkUsageCapReached = 246,
+    PaymentLinkInactive = 247,
+    InvalidPaymentLinkAmount = 248,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -398,7 +408,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
                     core::mem::transmute::<u32, SubscriptionError>(code)
                 }));
             }
-            if (200..=243).contains(&code) {
+            if (200..=248).contains(&code) {
                 return Ok(Error::Payment(unsafe {
                     core::mem::transmute::<u32, PaymentError>(code)
                 }));
@@ -1107,6 +1117,39 @@ pub struct RequireRegisteredMerchantsSet {
     pub admin: Address,
 }
 
+// Reusable payment link events
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentLinkCreated {
+    pub link_id: u64,
+    pub merchant: Address,
+    pub amount: i128,
+    pub usage_cap: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentLinkUsed {
+    pub link_id: u64,
+    pub payment_id: u64,
+    pub customer: Address,
+    pub usage_count: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentLinkDeactivated {
+    pub link_id: u64,
+    pub merchant: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentLinkReactivated {
+    pub link_id: u64,
+    pub merchant: Address,
+}
+
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaymentCompleted {
@@ -1740,6 +1783,39 @@ pub struct PaymentRequest {
     pub created_at: u64,
     /// Id of the payment created when the request was paid.
     pub payment_id: Option<u64>,
+}
+
+/// Status of a reusable payment link.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum PaymentLinkStatus {
+    Active,
+    Inactive,
+    Expired,
+}
+
+/// A reusable payment link with a usage cap.
+/// Allows merchants to create a link that can be used multiple times
+/// up to a specified limit before it expires or is deactivated.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct PaymentLink {
+    pub id: u64,
+    pub merchant: Address,
+    pub amount: i128,
+    pub token: Address,
+    pub currency: Currency,
+    /// Maximum number of times this link can be used (0 = unlimited).
+    pub usage_cap: u32,
+    /// Current number of times this link has been used.
+    pub usage_count: u32,
+    /// Ledger timestamp after which the link can no longer be used (0 = never).
+    pub expires_at: u64,
+    pub metadata: String,
+    pub description: String,
+    pub status: PaymentLinkStatus,
+    pub created_at: u64,
+    pub last_used_at: Option<u64>,
 }
 
 /// Maximum length, in bytes, of a registered merchant's display name (#669).
@@ -3293,6 +3369,243 @@ impl PaymentContract {
             .ok_or(Error::Payment(PaymentError::RequestNotFound))
     }
 
+    /// Creates a reusable payment link with a usage cap.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant creating the link (must authorize)
+    /// * `amount` - The payment amount (must be positive)
+    /// * `token` - The token address for payments
+    /// * `currency` - The currency type
+    /// * `usage_cap` - Maximum number of uses (0 = unlimited)
+    /// * `expiry_seconds` - Seconds until expiration (0 = never expires)
+    /// * `metadata` - Optional metadata string
+    /// * `description` - Description of what the link is for
+    ///
+    /// # Returns
+    /// The created link's ID, or an error if parameters are invalid.
+    pub fn create_payment_link(
+        env: Env,
+        merchant: Address,
+        amount: i128,
+        token: Address,
+        currency: Currency,
+        usage_cap: u32,
+        expiry_seconds: u64,
+        metadata: String,
+        description: String,
+    ) -> Result<u64, Error> {
+        merchant.require_auth();
+        Self::require_not_paused(&env, "create_payment_link")?;
+
+        if amount <= 0 {
+            return Err(Error::Payment(PaymentError::InvalidPaymentLinkAmount));
+        }
+
+        // Get and increment counter
+        let counter_key = DataKey::Payment(PaymentKey::PaymentLinkCounter);
+        let link_id: u64 = env.store().get(&counter_key).unwrap_or(0) + 1;
+        env.store().set(&counter_key, &link_id);
+
+        let current_time = env.ledger().timestamp();
+        let expires_at = if expiry_seconds > 0 {
+            current_time + expiry_seconds
+        } else {
+            0
+        };
+
+        let link = PaymentLink {
+            id: link_id,
+            merchant: merchant.clone(),
+            amount,
+            token,
+            currency,
+            usage_cap,
+            usage_count: 0,
+            expires_at,
+            metadata,
+            description,
+            status: PaymentLinkStatus::Active,
+            created_at: current_time,
+            last_used_at: None,
+        };
+
+        env.store()
+            .set(&DataKey::Payment(PaymentKey::PaymentLink(link_id)), &link);
+
+        PaymentLinkCreated {
+            link_id,
+            merchant,
+            amount,
+            usage_cap,
+        }
+        .publish(&env);
+
+        Ok(link_id)
+    }
+
+    /// Uses a payment link to create a payment.
+    ///
+    /// # Arguments
+    /// * `customer` - The customer making the payment (must authorize)
+    /// * `link_id` - The payment link to use
+    ///
+    /// # Returns
+    /// The created payment's ID, or an error if the link is inactive, expired,
+    /// or has reached its usage cap.
+    pub fn use_payment_link(
+        env: Env,
+        customer: Address,
+        link_id: u64,
+    ) -> Result<u64, Error> {
+        customer.require_auth();
+        Self::require_not_paused(&env, "use_payment_link")?;
+        Self::require_not_paused(&env, "create_payment")?;
+
+        let link_key = DataKey::Payment(PaymentKey::PaymentLink(link_id));
+        let mut link: PaymentLink = env
+            .store()
+            .get(&link_key)
+            .ok_or(Error::Payment(PaymentError::PaymentLinkNotFound))?;
+
+        // Check link status
+        if link.status != PaymentLinkStatus::Active {
+            return Err(Error::Payment(PaymentError::PaymentLinkInactive));
+        }
+
+        // Check expiration
+        let current_time = env.ledger().timestamp();
+        if link.expires_at > 0 && current_time >= link.expires_at {
+            link.status = PaymentLinkStatus::Expired;
+            env.store().set(&link_key, &link);
+            return Err(Error::Payment(PaymentError::PaymentLinkExpired));
+        }
+
+        // Check usage cap
+        if link.usage_cap > 0 && link.usage_count >= link.usage_cap {
+            return Err(Error::Payment(PaymentError::PaymentLinkUsageCapReached));
+        }
+
+        // Create payment using the link details
+        let payment_id = Self::create_payment(
+            env.clone(),
+            customer.clone(),
+            link.merchant.clone(),
+            link.amount,
+            link.token.clone(),
+            link.currency.clone(),
+            0, // no expiry on the payment itself
+            link.metadata.clone(),
+            String::from_str(&env, ""),
+        )?;
+
+        // Update link usage
+        link.usage_count += 1;
+        link.last_used_at = Some(current_time);
+        env.store().set(&link_key, &link);
+
+        PaymentLinkUsed {
+            link_id,
+            payment_id,
+            customer,
+            usage_count: link.usage_count,
+        }
+        .publish(&env);
+
+        Ok(payment_id)
+    }
+
+    /// Deactivates a payment link so it can no longer be used.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant that created the link (must authorize)
+    /// * `link_id` - The link to deactivate
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or an error if the link doesn't exist or the
+    /// caller is not its merchant.
+    pub fn deactivate_payment_link(
+        env: Env,
+        merchant: Address,
+        link_id: u64,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+
+        let link_key = DataKey::Payment(PaymentKey::PaymentLink(link_id));
+        let mut link: PaymentLink = env
+            .store()
+            .get(&link_key)
+            .ok_or(Error::Payment(PaymentError::PaymentLinkNotFound))?;
+
+        if link.merchant != merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        link.status = PaymentLinkStatus::Inactive;
+        env.store().set(&link_key, &link);
+
+        PaymentLinkDeactivated {
+            link_id,
+            merchant,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Reactivates a payment link so it can be used again.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant that created the link (must authorize)
+    /// * `link_id` - The link to reactivate
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or an error if the link doesn't exist, the
+    /// caller is not its merchant, or the link is expired.
+    pub fn reactivate_payment_link(
+        env: Env,
+        merchant: Address,
+        link_id: u64,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+
+        let link_key = DataKey::Payment(PaymentKey::PaymentLink(link_id));
+        let mut link: PaymentLink = env
+            .store()
+            .get(&link_key)
+            .ok_or(Error::Payment(PaymentError::PaymentLinkNotFound))?;
+
+        if link.merchant != merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        // Can't reactivate expired links
+        let current_time = env.ledger().timestamp();
+        if link.expires_at > 0 && current_time >= link.expires_at {
+            return Err(Error::Payment(PaymentError::PaymentLinkExpired));
+        }
+
+        link.status = PaymentLinkStatus::Active;
+        env.store().set(&link_key, &link);
+
+        PaymentLinkReactivated {
+            link_id,
+            merchant,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Returns a payment link by id.
+    ///
+    /// # Returns
+    /// The `PaymentLink`, or `PaymentLinkNotFound` if it does not exist.
+    pub fn get_payment_link(env: Env, link_id: u64) -> Result<PaymentLink, Error> {
+        env.store()
+            .get(&DataKey::Payment(PaymentKey::PaymentLink(link_id)))
+            .ok_or(Error::Payment(PaymentError::PaymentLinkNotFound))
+    }
+
     /// Adds a fee-exempt tip for the merchant to a pending payment (#675).
     ///
     /// The tip is transferred from the customer into the contract immediately
@@ -3350,7 +3663,7 @@ impl PaymentContract {
 
         token::Client::new(&env, &payment.token).transfer(
             &customer,
-            env.current_contract_address(),
+            &env.current_contract_address(),
             &tip_amount,
         );
         let total_tip = PaymentContract::get_tip(&env, payment_id) + tip_amount;
