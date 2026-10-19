@@ -1693,6 +1693,13 @@ impl RefundContract {
     const CURRENT_SCHEMA_VERSION: u32 = 2;
     // Issue #696: how long a merchant counter-offer stays open (7 days).
     const COUNTER_OFFER_TTL_SECONDS: u64 = 604800;
+    // Issue #647: TTL extension for persistent storage
+    #[allow(dead_code)]
+    const LEDGERS_PER_DAY: u32 = 17_280;
+    #[allow(dead_code)]
+    const PERSISTENT_TTL_THRESHOLD: u32 = 30_672_000; // 30 * LEDGERS_PER_DAY
+    #[allow(dead_code)]
+    const PERSISTENT_TTL_EXTEND_TO: u32 = 92_016_000; // 90 * LEDGERS_PER_DAY
 
     /// Initialize the refund contract with an admin address.
     ///
@@ -2734,6 +2741,20 @@ impl RefundContract {
         let new_balance = Self::get_refund_reserve(env.clone(), merchant.clone(), token.clone())
             .checked_add(amount)
             .ok_or(Error::Core(CoreError::InvalidAmount))?;
+        // Issue #647: Extend TTL on persistent entry read (if it exists)
+        if env
+            .storage()
+            .persistent()
+            .has(&RefundExtKey::MerchantRefundReserve(
+                merchant.clone(),
+                token.clone(),
+            ))
+        {
+            Self::extend_refund_ext_ttl(
+                &env,
+                &RefundExtKey::MerchantRefundReserve(merchant.clone(), token.clone()),
+            );
+        }
         Self::set_refund_reserve(&env, &merchant, &token, new_balance);
 
         (RefundReserveDeposited {
@@ -2779,6 +2800,34 @@ impl RefundContract {
             return Err(Error::Ext(ExtError::ReserveBelowMinimum));
         }
 
+        // Issue #647: Extend TTL on persistent entry reads (if they exist)
+        if env
+            .storage()
+            .persistent()
+            .has(&RefundExtKey::MerchantRefundReserve(
+                merchant.clone(),
+                token.clone(),
+            ))
+        {
+            Self::extend_refund_ext_ttl(
+                &env,
+                &RefundExtKey::MerchantRefundReserve(merchant.clone(), token.clone()),
+            );
+        }
+        if env
+            .storage()
+            .persistent()
+            .has(&RefundExtKey::MinRefundReserve(
+                merchant.clone(),
+                token.clone(),
+            ))
+        {
+            Self::extend_refund_ext_ttl(
+                &env,
+                &RefundExtKey::MinRefundReserve(merchant.clone(), token.clone()),
+            );
+        }
+
         Self::set_refund_reserve(&env, &merchant, &token, new_balance);
         token::Client::new(&env, &token).transfer(
             &env.current_contract_address(),
@@ -2820,6 +2869,11 @@ impl RefundContract {
             &RefundExtKey::MinRefundReserve(merchant.clone(), token.clone()),
             &min_amount,
         );
+        // Issue #647: Extend TTL on persistent entry write
+        Self::extend_refund_ext_ttl(
+            &env,
+            &RefundExtKey::MinRefundReserve(merchant.clone(), token.clone()),
+        );
 
         (MinRefundReserveSet {
             merchant,
@@ -2858,6 +2912,11 @@ impl RefundContract {
         env.storage().persistent().set(
             &RefundExtKey::MerchantRefundReserve(merchant.clone(), token.clone()),
             &balance,
+        );
+        // Issue #647: Extend TTL on persistent entry write
+        Self::extend_refund_ext_ttl(
+            env,
+            &RefundExtKey::MerchantRefundReserve(merchant.clone(), token.clone()),
         );
     }
 
@@ -5301,6 +5360,8 @@ impl RefundContract {
             &RefundExtKey::ScheduledRefundPolicy(merchant.clone()),
             &scheduled,
         );
+        // Issue #647: Extend TTL on persistent entry write
+        Self::extend_refund_ext_ttl(&env, &RefundExtKey::ScheduledRefundPolicy(merchant.clone()));
 
         (RefundPolicyChangeScheduled {
             merchant,
@@ -7984,6 +8045,11 @@ impl RefundContract {
                     &DataKey::CustomerRefundsArchive(customer.clone(), start),
                     &archived_id,
                 );
+                // Issue #647: Extend TTL on persistent entry write
+                Self::extend_data_key_ttl(
+                    env,
+                    &DataKey::CustomerRefundsArchive(customer.clone(), start),
+                );
             }
             env.storage()
                 .instance()
@@ -10604,6 +10670,20 @@ impl RefundContract {
             return Err(Error::Ext(ExtError::InsufficientRefundReserve));
         }
         let new_reserve_balance = balance - total;
+        // Issue #647: Extend TTL on persistent entry read (if it exists)
+        if env
+            .storage()
+            .persistent()
+            .has(&RefundExtKey::MerchantRefundReserve(
+                merchant.clone(),
+                token.clone(),
+            ))
+        {
+            Self::extend_refund_ext_ttl(
+                &env,
+                &RefundExtKey::MerchantRefundReserve(merchant.clone(), token.clone()),
+            );
+        }
         Self::set_refund_reserve(&env, &merchant, &token, new_reserve_balance);
 
         let now = env.ledger().timestamp();
@@ -11056,6 +11136,24 @@ impl RefundContract {
         };
 
         Ok(())
+    }
+
+    // Issue #647: Helper to extend TTL of persistent RefundExtKey entries
+    fn extend_refund_ext_ttl(env: &Env, key: &RefundExtKey) {
+        env.storage().persistent().extend_ttl(
+            key,
+            Self::PERSISTENT_TTL_THRESHOLD,
+            Self::PERSISTENT_TTL_EXTEND_TO,
+        );
+    }
+
+    // Issue #647: Helper to extend TTL of persistent DataKey entries
+    fn extend_data_key_ttl(env: &Env, key: &DataKey) {
+        env.storage().persistent().extend_ttl(
+            key,
+            Self::PERSISTENT_TTL_THRESHOLD,
+            Self::PERSISTENT_TTL_EXTEND_TO,
+        );
     }
 
     // Issue #370: Customer tier management
