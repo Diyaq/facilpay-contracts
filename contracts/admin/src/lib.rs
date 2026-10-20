@@ -922,7 +922,15 @@ impl AdminContract {
 
         env.storage()
             .instance()
-            .set(&DataKey::PaymentContract, &payment_contract);
+            .set(&DataKey::PaymentContract, &payment_contract.clone());
+
+        ChildContractUpdated {
+            child_kind: ChildKind::Payment,
+            new_address: payment_contract,
+            updated_by: admin,
+            updated_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -946,7 +954,15 @@ impl AdminContract {
 
         env.storage()
             .instance()
-            .set(&DataKey::EscrowContract, &escrow_contract);
+            .set(&DataKey::EscrowContract, &escrow_contract.clone());
+
+        ChildContractUpdated {
+            child_kind: ChildKind::Escrow,
+            new_address: escrow_contract,
+            updated_by: admin,
+            updated_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -970,7 +986,15 @@ impl AdminContract {
 
         env.storage()
             .instance()
-            .set(&DataKey::RefundContract, &refund_contract);
+            .set(&DataKey::RefundContract, &refund_contract.clone());
+
+        ChildContractUpdated {
+            child_kind: ChildKind::Refund,
+            new_address: refund_contract,
+            updated_by: admin,
+            updated_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
 
         Ok(())
     }
