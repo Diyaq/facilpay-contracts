@@ -51,6 +51,8 @@ pub enum ConfigKey {
     MaxForwardDepth,
     // Issue #669: reject payments to unregistered or deactivated merchants
     RequireRegisteredMerchants,
+    // Issue #809: refund contract allowed to call `record_refund`
+    RefundContract,
 }
 
 #[derive(Clone)]
@@ -81,6 +83,8 @@ pub enum PaymentKey {
     // Issue #662: merchant-initiated payment requests
     RequestCounter,
     Request(u64),
+    // Issue #809: refund-contract refund ids already applied to a payment
+    RefundSynced(u64),
 }
 
 pub const MAX_MEMO_VERSIONS: u32 = 10;
@@ -234,6 +238,8 @@ pub enum PaymentError {
     MerchantNotRegistered = 241,
     MerchantInactive = 242,
     InvalidMerchantName = 243,
+    // Issue #809: refund sync from the refund contract
+    RefundContractNotSet = 244,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -398,7 +404,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
                     core::mem::transmute::<u32, SubscriptionError>(code)
                 }));
             }
-            if (200..=243).contains(&code) {
+            if (200..=244).contains(&code) {
                 return Ok(Error::Payment(unsafe {
                     core::mem::transmute::<u32, PaymentError>(code)
                 }));
@@ -1125,6 +1131,25 @@ pub struct PaymentRefunded {
     pub payment_id: u64,
     pub customer: Address,
     pub amount: i128,
+}
+
+/// Emitted when the registered refund contract records a processed refund (#809).
+#[contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PaymentRefundSynced {
+    pub payment_id: u64,
+    pub refund_id: u64,
+    pub amount: i128,
+    pub refunded_amount: i128,
+    pub status: PaymentStatus,
+}
+
+/// Emitted when the admin registers the refund contract (#809).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundContractSet {
+    pub refund_contract: Address,
+    pub set_by: Address,
 }
 
 #[contractevent]
@@ -5935,6 +5960,143 @@ impl PaymentContract {
             payment_id,
             customer: payment.customer,
             amount: payment.amount,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Registers the refund contract allowed to call `record_refund` (#809).
+    ///
+    /// # Arguments
+    /// * `admin` - The contract admin (must authorize)
+    /// * `refund_contract` - Address of the refund contract
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `BasicError::Unauthorized` if `admin` is not the
+    /// contract admin.
+    pub fn set_refund_contract(
+        env: Env,
+        admin: Address,
+        refund_contract: Address,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .store()
+            .get(&DataKey::Config(ConfigKey::Admin))
+            .ok_or(Error::Basic(BasicError::Unauthorized))?;
+        if admin != stored_admin {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        env.store().set(
+            &DataKey::Config(ConfigKey::RefundContract),
+            &refund_contract,
+        );
+        (RefundContractSet {
+            refund_contract,
+            set_by: admin,
+        })
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Returns the registered refund contract, if any (#809).
+    pub fn get_refund_contract(env: Env) -> Option<Address> {
+        env.store().get(&DataKey::Config(ConfigKey::RefundContract))
+    }
+
+    /// Records a refund processed by the registered refund contract (#809).
+    ///
+    /// Adds `amount` to the payment's `refunded_amount` and moves a `Completed`
+    /// payment to `PartialRefunded`, or to `Refunded` once the full amount has
+    /// been refunded. Funds are not moved: the refund contract has already
+    /// paid the customer.
+    ///
+    /// # Arguments
+    /// * `refund_contract` - The calling refund contract (must authorize and be registered)
+    /// * `payment_id` - The payment the refund belongs to
+    /// * `refund_id` - The refund contract's refund id, applied at most once
+    /// * `amount` - The refunded amount in base token units
+    ///
+    /// # Returns
+    /// `Ok(())` on success. Errors: `PaymentError::RefundContractNotSet` if no
+    /// refund contract is registered, `BasicError::Unauthorized` if the caller is
+    /// not the registered refund contract, `BasicError::InvalidAmount` if
+    /// `amount <= 0`, `PaymentError::NotFound`, `PaymentError::AlreadyProcessed`
+    /// if `refund_id` was already recorded or the payment is fully refunded,
+    /// `PaymentError::InvalidStatus` if the payment is not `Completed` or
+    /// `PartialRefunded`, and `PaymentError::RefundExceedsPayment` if the total
+    /// refunded would exceed the payment amount.
+    pub fn record_refund(
+        env: Env,
+        refund_contract: Address,
+        payment_id: u64,
+        refund_id: u64,
+        amount: i128,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "record_refund")?;
+        let registered: Address = env
+            .store()
+            .get(&DataKey::Config(ConfigKey::RefundContract))
+            .ok_or(Error::Payment(PaymentError::RefundContractNotSet))?;
+        if refund_contract != registered {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        refund_contract.require_auth();
+
+        if amount <= 0 {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+        let synced_key = DataKey::Payment(PaymentKey::RefundSynced(refund_id));
+        if env.store().has(&synced_key) {
+            return Err(Error::Payment(PaymentError::AlreadyProcessed));
+        }
+
+        let mut payment: Payment = env
+            .store()
+            .get(&DataKey::Payment(PaymentKey::Data(payment_id)))
+            .ok_or(Error::Payment(PaymentError::NotFound))?;
+        match payment.status {
+            PaymentStatus::Completed | PaymentStatus::PartialRefunded => {}
+            PaymentStatus::Refunded => return Err(Error::Payment(PaymentError::AlreadyProcessed)),
+            PaymentStatus::Pending | PaymentStatus::Cancelled => {
+                return Err(Error::Payment(PaymentError::InvalidStatus))
+            }
+        }
+
+        let new_refunded = payment
+            .refunded_amount
+            .checked_add(amount)
+            .ok_or(Error::Payment(PaymentError::RefundExceedsPayment))?;
+        if new_refunded > payment.amount {
+            return Err(Error::Payment(PaymentError::RefundExceedsPayment));
+        }
+        let previous_status = payment.status.clone();
+        payment.refunded_amount = new_refunded;
+        payment.status = if new_refunded == payment.amount {
+            PaymentStatus::Refunded
+        } else {
+            PaymentStatus::PartialRefunded
+        };
+
+        env.store()
+            .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        env.store().set(&synced_key, &payment_id);
+        if payment.status != previous_status {
+            PaymentContract::record_status_change(
+                &env,
+                payment_id,
+                payment.status.clone(),
+                refund_contract,
+            );
+        }
+
+        (PaymentRefundSynced {
+            payment_id,
+            refund_id,
+            amount,
+            refunded_amount: new_refunded,
+            status: payment.status,
         })
         .publish(&env);
 
@@ -15695,3 +15857,6 @@ mod test_merchant_registry;
 
 #[cfg(test)]
 mod test_mandates;
+
+#[cfg(test)]
+mod test_refund_sync;
