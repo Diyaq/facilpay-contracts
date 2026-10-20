@@ -51,6 +51,8 @@ pub enum ConfigKey {
     MaxForwardDepth,
     // Issue #669: reject payments to unregistered or deactivated merchants
     RequireRegisteredMerchants,
+    // Issue #809: refund contract allowed to call `record_refund`
+    RefundContract,
 }
 
 #[derive(Clone)]
@@ -81,6 +83,8 @@ pub enum PaymentKey {
     // Issue #662: merchant-initiated payment requests
     RequestCounter,
     Request(u64),
+    // Issue #809: refund-contract refund ids already applied to a payment
+    RefundSynced(u64),
 }
 
 pub const MAX_MEMO_VERSIONS: u32 = 10;
@@ -234,6 +238,8 @@ pub enum PaymentError {
     MerchantNotRegistered = 241,
     MerchantInactive = 242,
     InvalidMerchantName = 243,
+    // Issue #809: refund sync from the refund contract
+    RefundContractNotSet = 244,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -398,7 +404,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
                     core::mem::transmute::<u32, SubscriptionError>(code)
                 }));
             }
-            if (200..=243).contains(&code) {
+            if (200..=244).contains(&code) {
                 return Ok(Error::Payment(unsafe {
                     core::mem::transmute::<u32, PaymentError>(code)
                 }));
@@ -884,6 +890,10 @@ pub enum TestError {
     // Arithmetic safety
     BillingOverflow = 124,
     InvalidInterval = 125,
+    // Subscription transfer
+    SubscriptionTransferNotAllowed = 126,
+    InvalidTransferRecipient = 127,
+    SubscriptionNotTransferable = 128,
 }
 
 // Manual trait implementations replacing #[contracterror] (105 variants exceed the 50-variant XDR spec limit)
@@ -1123,6 +1133,25 @@ pub struct PaymentRefunded {
     pub amount: i128,
 }
 
+/// Emitted when the registered refund contract records a processed refund (#809).
+#[contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PaymentRefundSynced {
+    pub payment_id: u64,
+    pub refund_id: u64,
+    pub amount: i128,
+    pub refunded_amount: i128,
+    pub status: PaymentStatus,
+}
+
+/// Emitted when the admin registers the refund contract (#809).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundContractSet {
+    pub refund_contract: Address,
+    pub set_by: Address,
+}
+
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaymentCancelled {
@@ -1226,6 +1255,16 @@ pub struct RecurringPaymentFailed {
 pub struct SubscriptionCancelled {
     pub subscription_id: u64,
     pub cancelled_by: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionTransferred {
+    pub subscription_id: u64,
+    pub from_customer: Address,
+    pub to_customer: Address,
+    pub transferred_by: Address,
+    pub transferred_at: u64,
 }
 
 #[contractevent]
@@ -5927,6 +5966,143 @@ impl PaymentContract {
         Ok(())
     }
 
+    /// Registers the refund contract allowed to call `record_refund` (#809).
+    ///
+    /// # Arguments
+    /// * `admin` - The contract admin (must authorize)
+    /// * `refund_contract` - Address of the refund contract
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `BasicError::Unauthorized` if `admin` is not the
+    /// contract admin.
+    pub fn set_refund_contract(
+        env: Env,
+        admin: Address,
+        refund_contract: Address,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .store()
+            .get(&DataKey::Config(ConfigKey::Admin))
+            .ok_or(Error::Basic(BasicError::Unauthorized))?;
+        if admin != stored_admin {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        env.store().set(
+            &DataKey::Config(ConfigKey::RefundContract),
+            &refund_contract,
+        );
+        (RefundContractSet {
+            refund_contract,
+            set_by: admin,
+        })
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Returns the registered refund contract, if any (#809).
+    pub fn get_refund_contract(env: Env) -> Option<Address> {
+        env.store().get(&DataKey::Config(ConfigKey::RefundContract))
+    }
+
+    /// Records a refund processed by the registered refund contract (#809).
+    ///
+    /// Adds `amount` to the payment's `refunded_amount` and moves a `Completed`
+    /// payment to `PartialRefunded`, or to `Refunded` once the full amount has
+    /// been refunded. Funds are not moved: the refund contract has already
+    /// paid the customer.
+    ///
+    /// # Arguments
+    /// * `refund_contract` - The calling refund contract (must authorize and be registered)
+    /// * `payment_id` - The payment the refund belongs to
+    /// * `refund_id` - The refund contract's refund id, applied at most once
+    /// * `amount` - The refunded amount in base token units
+    ///
+    /// # Returns
+    /// `Ok(())` on success. Errors: `PaymentError::RefundContractNotSet` if no
+    /// refund contract is registered, `BasicError::Unauthorized` if the caller is
+    /// not the registered refund contract, `BasicError::InvalidAmount` if
+    /// `amount <= 0`, `PaymentError::NotFound`, `PaymentError::AlreadyProcessed`
+    /// if `refund_id` was already recorded or the payment is fully refunded,
+    /// `PaymentError::InvalidStatus` if the payment is not `Completed` or
+    /// `PartialRefunded`, and `PaymentError::RefundExceedsPayment` if the total
+    /// refunded would exceed the payment amount.
+    pub fn record_refund(
+        env: Env,
+        refund_contract: Address,
+        payment_id: u64,
+        refund_id: u64,
+        amount: i128,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "record_refund")?;
+        let registered: Address = env
+            .store()
+            .get(&DataKey::Config(ConfigKey::RefundContract))
+            .ok_or(Error::Payment(PaymentError::RefundContractNotSet))?;
+        if refund_contract != registered {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        refund_contract.require_auth();
+
+        if amount <= 0 {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+        let synced_key = DataKey::Payment(PaymentKey::RefundSynced(refund_id));
+        if env.store().has(&synced_key) {
+            return Err(Error::Payment(PaymentError::AlreadyProcessed));
+        }
+
+        let mut payment: Payment = env
+            .store()
+            .get(&DataKey::Payment(PaymentKey::Data(payment_id)))
+            .ok_or(Error::Payment(PaymentError::NotFound))?;
+        match payment.status {
+            PaymentStatus::Completed | PaymentStatus::PartialRefunded => {}
+            PaymentStatus::Refunded => return Err(Error::Payment(PaymentError::AlreadyProcessed)),
+            PaymentStatus::Pending | PaymentStatus::Cancelled => {
+                return Err(Error::Payment(PaymentError::InvalidStatus))
+            }
+        }
+
+        let new_refunded = payment
+            .refunded_amount
+            .checked_add(amount)
+            .ok_or(Error::Payment(PaymentError::RefundExceedsPayment))?;
+        if new_refunded > payment.amount {
+            return Err(Error::Payment(PaymentError::RefundExceedsPayment));
+        }
+        let previous_status = payment.status.clone();
+        payment.refunded_amount = new_refunded;
+        payment.status = if new_refunded == payment.amount {
+            PaymentStatus::Refunded
+        } else {
+            PaymentStatus::PartialRefunded
+        };
+
+        env.store()
+            .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        env.store().set(&synced_key, &payment_id);
+        if payment.status != previous_status {
+            PaymentContract::record_status_change(
+                &env,
+                payment_id,
+                payment.status.clone(),
+                refund_contract,
+            );
+        }
+
+        (PaymentRefundSynced {
+            payment_id,
+            refund_id,
+            amount,
+            refunded_amount: new_refunded,
+            status: payment.status,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
     /// Cancels a pending payment.
     ///
     /// # Arguments
@@ -6419,6 +6595,61 @@ impl PaymentContract {
                 MerchantDataKey::MerchantActiveSubscriptions(merchant, page),
             ))
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    fn add_to_customer_subscriptions(env: &Env, customer: &Address, subscription_id: u64) {
+        let count: u64 = env
+            .store()
+            .get(&DataKey::Customer(CustomerDataKey::SubscriptionCount(
+                customer.clone(),
+            )))
+            .unwrap_or(0);
+        
+        let page = count / 100;
+        let page_index = count % 100;
+        
+        let key = DataKey::Customer(CustomerDataKey::Subscriptions(customer.clone(), page));
+        let mut page_subs: Vec<u64> = env.store().get(&key).unwrap_or_else(|| Vec::new(env));
+        page_subs.push_back(subscription_id);
+        env.store().set(&key, &page_subs);
+        
+        env.store().set(
+            &DataKey::Customer(CustomerDataKey::SubscriptionCount(customer.clone())),
+            &(count + 1),
+        );
+    }
+
+    fn remove_from_customer_subscriptions(env: &Env, customer: &Address, subscription_id: u64) {
+        let count: u64 = env
+            .store()
+            .get(&DataKey::Customer(CustomerDataKey::SubscriptionCount(
+                customer.clone(),
+            )))
+            .unwrap_or(0);
+        
+        if count == 0 {
+            return;
+        }
+
+        // Linear search through pages to find and remove the subscription
+        for page in 0..=((count - 1) / 100) {
+            let key = DataKey::Customer(CustomerDataKey::Subscriptions(customer.clone(), page));
+            if let Some(mut page_subs): Option<Vec<u64>> = env.store().get(&key) {
+                if let Some(pos) = page_subs.iter().position(|&id| id == subscription_id) {
+                    page_subs.remove(pos as u32);
+                    if page_subs.is_empty() {
+                        env.store().remove(&key);
+                    } else {
+                        env.store().set(&key, &page_subs);
+                    }
+                    env.store().set(
+                        &DataKey::Customer(CustomerDataKey::SubscriptionCount(customer.clone())),
+                        &(count - 1),
+                    );
+                    return;
+                }
+            }
+        }
     }
 
     fn is_valid_currency(currency: &Currency) -> bool {
@@ -7503,6 +7734,108 @@ impl PaymentContract {
         (SubscriptionCancelled {
             subscription_id,
             cancelled_by: caller,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Transfer a subscription to another customer.
+    ///
+    /// Allows the current customer to transfer their subscription to a new customer.
+    /// The merchant can also authorize the transfer if needed.
+    ///
+    /// # Arguments
+    /// * `caller` - The current customer or merchant authorizing the transfer.
+    /// * `subscription_id` - The ID of the subscription to transfer.
+    /// * `new_customer` - The address of the new customer to receive the subscription.
+    ///
+    /// # Errors
+    /// Returns `SubscriptionNotFound` if the subscription doesn't exist.
+    /// Returns `Unauthorized` if the caller is neither the customer nor the merchant.
+    /// Returns `InvalidStatus` if the subscription is cancelled or expired.
+    /// Returns `InvalidTransferRecipient` if the new customer is the same as the current customer.
+    /// Returns `SubscriptionNotTransferable` if the subscription is in dunning or suspended status.
+    pub fn transfer_subscription(
+        env: Env,
+        caller: Address,
+        subscription_id: u64,
+        new_customer: Address,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+
+        if !env
+            .store()
+            .has(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
+        {
+            return Err(Error::Subscription(SubscriptionError::NotFound));
+        }
+
+        let mut sub: Subscription = env
+            .store()
+            .get(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
+            .unwrap();
+
+        // Only customer or merchant can transfer
+        let is_authorized = sub.customer == caller || sub.merchant == caller;
+        if !is_authorized {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        // Cannot transfer cancelled or expired subscriptions
+        if sub.status == SubscriptionStatus::Cancelled || sub.status == SubscriptionStatus::Expired
+        {
+            return Err(Error::Payment(PaymentError::InvalidStatus));
+        }
+
+        // Cannot transfer subscriptions in dunning or suspended status
+        if sub.status == SubscriptionStatus::InDunning
+            || sub.status == SubscriptionStatus::Suspended
+        {
+            return Err(Error::Payment(PaymentError::SubscriptionNotTransferable));
+        }
+
+        // New customer must be different from current customer
+        if sub.customer == new_customer {
+            return Err(Error::Payment(PaymentError::InvalidTransferRecipient));
+        }
+
+        let old_customer = sub.customer.clone();
+
+        // Update subscription with new customer
+        sub.customer = new_customer.clone();
+        env.store().set(
+            &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
+            &sub,
+        );
+
+        // Update customer subscription indices
+        // Remove from old customer's subscription list
+        Self::remove_from_customer_subscriptions(&env, &old_customer, subscription_id);
+
+        // Add to new customer's subscription list
+        Self::add_to_customer_subscriptions(&env, &new_customer, subscription_id);
+
+        // Transfer any dunning state to new customer if it exists
+        if let Some(dunning_state): Option<DunningState> = env.store().get(&DataKey::Subscription(
+            SubscriptionKey::DunningState(subscription_id),
+        )) {
+            env.store().remove(&DataKey::Subscription(
+                SubscriptionKey::DunningState(subscription_id),
+            ));
+            // Clear dunning for clean transfer
+        }
+
+        (SubscriptionTransferred {
+            subscription_id,
+            from_customer: old_customer,
+            to_customer: new_customer,
+            transferred_by: caller,
+            transferred_at: env.ledger().timestamp(),
         })
         .publish(&env);
 
@@ -15524,3 +15857,6 @@ mod test_merchant_registry;
 
 #[cfg(test)]
 mod test_mandates;
+
+#[cfg(test)]
+mod test_refund_sync;

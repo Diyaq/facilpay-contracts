@@ -180,6 +180,10 @@ pub enum SystemKey {
     // Tracks the distinct (window_start, window_end) pairs cached above, so a newly
     // processed refund can invalidate only the windows it actually falls within.
     AnalyticsCacheWindows,
+    // Processing deadline configuration for approved refunds
+    RefundProcessingDeadlineConfig,
+    // Tracks when refund was approved for deadline enforcement
+    RefundApprovedTimestamp(u64),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -357,6 +361,9 @@ pub enum ExtError {
     // Issue #806: bulk promotional voucher issuance
     EmptyPromotionalBatch = 80,
     PromotionalBatchTooLarge = 81,
+    // Processing deadline for approved refunds
+    ProcessingDeadlineMissed = 82,
+    ProcessingDeadlineNotConfigured = 83,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -441,6 +448,26 @@ pub struct RefundProcessed {
     pub amount: i128,
     pub token: Address,
     pub processed_at: u64,
+}
+
+/// Emitted when a processed refund is recorded on the payment contract (#809).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundPaymentSynced {
+    pub refund_id: u64,
+    pub payment_id: u64,
+    pub amount: i128,
+}
+
+/// Emitted when a processed refund could not be recorded on the payment
+/// contract (#809). `payment_contract_set` is `false` when no payment contract
+/// address is configured, and `true` when the payment contract rejected the call.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundPaymentSyncFailed {
+    pub refund_id: u64,
+    pub payment_id: u64,
+    pub payment_contract_set: bool,
 }
 
 #[contractevent]
@@ -662,6 +689,23 @@ pub struct RefundVoucher {
     pub issued_at: u64,
     pub expires_at: u64,
     pub redeemed: bool,
+}
+
+// Processing deadline configuration for approved refunds
+#[derive(Clone)]
+#[contracttype]
+pub struct RefundProcessingDeadlineConfig {
+    pub deadline_seconds: u64,
+    pub enabled: bool,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcessingDeadlineMissed {
+    pub refund_id: u64,
+    pub approved_at: u64,
+    pub deadline: u64,
+    pub current_time: u64,
 }
 
 // Issue #696: merchant counter-offer for a partial refund
@@ -1375,6 +1419,8 @@ pub enum RefundExtKey {
     CounterOffer(u64),
     // Issue #807: per-(merchant, category index) refund percentage cap in bps.
     CategoryRefundCap(Address, u32),
+    // Issue #809: set once a processed refund is recorded on the payment contract.
+    PaymentSynced(u64),
 }
 
 // Issue #807: emitted when a merchant sets a category refund percentage cap.
@@ -3986,6 +4032,143 @@ impl RefundContract {
         .publish(&env);
 
         ArbitrationCaseDecided { case_id, approved }.publish(&env);
+
+        Ok(())
+    }
+
+    /// Set the processing deadline for approved refunds.
+    ///
+    /// Once configured, approved refunds must be processed within the deadline_seconds
+    /// from their approval timestamp, otherwise they become enforceable by customers.
+    ///
+    /// # Arguments
+    /// * `admin` - The contract admin setting the deadline configuration.
+    /// * `deadline_seconds` - The deadline duration in seconds (e.g., 3 days = 259200).
+    /// * `enabled` - Whether the deadline enforcement is enabled.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the contract admin.
+    pub fn set_processing_deadline_config(
+        env: Env,
+        admin: Address,
+        deadline_seconds: u64,
+        enabled: bool,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        
+        let config = RefundProcessingDeadlineConfig {
+            deadline_seconds,
+            enabled,
+        };
+        
+        env.storage()
+            .instance()
+            .set(&SystemKey::RefundProcessingDeadlineConfig, &config);
+        
+        Ok(())
+    }
+
+    /// Get the current processing deadline configuration.
+    ///
+    /// # Returns
+    /// The processing deadline configuration, or a default config (disabled) if not set.
+    pub fn get_processing_deadline_config(env: Env) -> RefundProcessingDeadlineConfig {
+        env.storage()
+            .instance()
+            .get(&SystemKey::RefundProcessingDeadlineConfig)
+            .unwrap_or(RefundProcessingDeadlineConfig {
+                deadline_seconds: 259200, // 3 days default
+                enabled: false,
+            })
+    }
+
+    /// Check if an approved refund has exceeded its processing deadline.
+    ///
+    /// # Arguments
+    /// * `refund_id` - The ID of the refund to check.
+    ///
+    /// # Returns
+    /// `true` if the deadline has been exceeded, `false` otherwise.
+    ///
+    /// # Errors
+    /// Returns `RefundNotFound` if the refund does not exist.
+    /// Returns `InvalidStatus` if the refund is not in `Approved` status.
+    /// Returns `ProcessingDeadlineNotConfigured` if deadline enforcement is disabled.
+    pub fn check_processing_deadline(env: Env, refund_id: u64) -> Result<bool, Error> {
+        let config = Self::get_processing_deadline_config(env.clone());
+        if !config.enabled {
+            return Err(Error::Ext(ExtError::ProcessingDeadlineNotConfigured));
+        }
+
+        let refund: Refund = env
+            .storage()
+            .instance()
+            .get(&DataKey::Refund(refund_id))
+            .ok_or(Error::Core(CoreError::RefundNotFound))?;
+
+        if refund.status != RefundStatus::Approved {
+            return Err(Error::Core(CoreError::InvalidStatus));
+        }
+
+        let approved_at = refund
+            .approved_at
+            .ok_or(Error::Core(CoreError::InvalidStatus))?;
+
+        let deadline = approved_at + config.deadline_seconds;
+        let now = env.ledger().timestamp();
+
+        if now >= deadline {
+            ProcessingDeadlineMissed {
+                refund_id,
+                approved_at,
+                deadline,
+                current_time: now,
+            }
+            .publish(&env);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Enforce processing deadline for a refund.
+    ///
+    /// If an approved refund has exceeded its processing deadline, this method can be
+    /// called by the customer to automatically process it or escalate it to arbitration.
+    ///
+    /// # Arguments
+    /// * `customer` - The customer enforcing the deadline (must be the refund's customer).
+    /// * `refund_id` - The ID of the refund to enforce.
+    ///
+    /// # Errors
+    /// Returns `RefundNotFound` if the refund does not exist.
+    /// Returns `Unauthorized` if the caller is not the refund's customer.
+    /// Returns `ProcessingDeadlineMissed` if the deadline has not been exceeded.
+    pub fn enforce_processing_deadline(
+        env: Env,
+        customer: Address,
+        refund_id: u64,
+    ) -> Result<(), Error> {
+        customer.require_auth();
+        
+        let refund: Refund = env
+            .storage()
+            .instance()
+            .get(&DataKey::Refund(refund_id))
+            .ok_or(Error::Core(CoreError::RefundNotFound))?;
+
+        if refund.customer != customer {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+
+        let deadline_exceeded = Self::check_processing_deadline(env.clone(), refund_id)?;
+        if !deadline_exceeded {
+            return Err(Error::Ext(ExtError::ProcessingDeadlineMissed));
+        }
+
+        // Automatically process the refund
+        Self::process_refund_internal(&env, customer, refund_id)?;
 
         Ok(())
     }
@@ -6845,10 +7028,15 @@ impl RefundContract {
         Self::clear_sla_deadline(env, refund_id);
         refund.status = RefundStatus::Approved;
         // Issue #147: Set approved_at timestamp
-        refund.approved_at = Some(env.ledger().timestamp());
+        let approved_at = env.ledger().timestamp();
+        refund.approved_at = Some(approved_at);
         env.storage()
             .instance()
             .set(&DataKey::Refund(refund_id), &refund);
+        // Store approved timestamp for deadline tracking
+        env.storage()
+            .instance()
+            .set(&SystemKey::RefundApprovedTimestamp(refund_id), &approved_at);
         Self::add_to_status_index(env, RefundStatus::Approved, refund_id);
 
         (RefundApproved {
@@ -6957,10 +7145,116 @@ impl RefundContract {
         })
         .publish(env);
 
+        // Issue #809: mirror the payout onto the payment record. Never reverts
+        // the payout; a failed sync can be retried with `retry_refund_sync`.
+        Self::sync_refund_to_payment(env, refund_id, refund.payment_id, refund.amount);
+
         // Issue #144: Invoke notification hooks
         Self::invoke_hooks(env, RefundEventType::Processed, refund_id);
 
         Ok(())
+    }
+
+    /// Records a processed refund on the payment contract via `record_refund`
+    /// (#809). Returns `true` once the payment contract has accepted it. If no
+    /// payment contract is set or the call fails, emits `RefundPaymentSyncFailed`
+    /// and returns `false` without reverting.
+    fn sync_refund_to_payment(env: &Env, refund_id: u64, payment_id: u64, amount: i128) -> bool {
+        let payment_contract: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaymentContractAddress);
+        let synced = match &payment_contract {
+            Some(payment_contract) => {
+                let args = (
+                    env.current_contract_address(),
+                    payment_id,
+                    refund_id,
+                    amount,
+                )
+                    .into_val(env);
+                matches!(
+                    env.try_invoke_contract::<(), soroban_sdk::InvokeError>(
+                        payment_contract,
+                        &Symbol::new(env, "record_refund"),
+                        args,
+                    ),
+                    Ok(Ok(()))
+                )
+            }
+            None => false,
+        };
+
+        if synced {
+            env.storage()
+                .persistent()
+                .set(&RefundExtKey::PaymentSynced(refund_id), &true);
+            (RefundPaymentSynced {
+                refund_id,
+                payment_id,
+                amount,
+            })
+            .publish(env);
+        } else {
+            (RefundPaymentSyncFailed {
+                refund_id,
+                payment_id,
+                payment_contract_set: payment_contract.is_some(),
+            })
+            .publish(env);
+        }
+        synced
+    }
+
+    /// Retries recording a processed refund on the payment contract (#809).
+    ///
+    /// Anyone may call this; it only pushes an already-processed refund to the
+    /// payment contract, which applies each refund id at most once.
+    ///
+    /// # Arguments
+    /// * `refund_id` - The processed refund to sync.
+    ///
+    /// # Returns
+    /// `true` if the payment contract accepted the update, `false` if it
+    /// rejected it (a `RefundPaymentSyncFailed` event is emitted).
+    ///
+    /// # Errors
+    /// Returns `RefundNotFound` if the refund does not exist, `InvalidStatus` if
+    /// it is not `Processed`, `RefundAlreadySynced` if it was already recorded,
+    /// and `PaymentContractNotSet` if no payment contract address is configured.
+    pub fn retry_refund_sync(env: Env, refund_id: u64) -> Result<bool, Error> {
+        let refund: Refund = env
+            .storage()
+            .instance()
+            .get(&DataKey::Refund(refund_id))
+            .ok_or(Error::Core(CoreError::RefundNotFound))?;
+        if refund.status != RefundStatus::Processed {
+            return Err(Error::Core(CoreError::InvalidStatus));
+        }
+        if Self::is_refund_synced(env.clone(), refund_id) {
+            return Err(Error::Ext(ExtError::RefundAlreadySynced));
+        }
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::PaymentContractAddress)
+        {
+            return Err(Error::Core(CoreError::PaymentContractNotSet));
+        }
+        Ok(Self::sync_refund_to_payment(
+            &env,
+            refund_id,
+            refund.payment_id,
+            refund.amount,
+        ))
+    }
+
+    /// Returns whether a processed refund has been recorded on the payment
+    /// contract (#809).
+    pub fn is_refund_synced(env: Env, refund_id: u64) -> bool {
+        env.storage()
+            .persistent()
+            .has(&RefundExtKey::PaymentSynced(refund_id))
     }
 
     fn get_external_payment(env: &Env, payment_id: u64) -> Result<ExternalPayment, Error> {
@@ -11377,3 +11671,6 @@ mod test_upgrade;
 
 #[cfg(test)]
 mod test_refund_reserve;
+
+#[cfg(test)]
+mod test_multi_token_arbitrator;
