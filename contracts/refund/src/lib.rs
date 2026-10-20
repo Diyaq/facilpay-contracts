@@ -118,6 +118,10 @@ pub enum ArbitrationKey {
     CaseByRefund(u64),
     // Present (true) while an arbitrator has opted out of new case assignments.
     ArbitratorUnavailable(Address),
+    // Arbitrator specialization by reason code
+    ArbitratorSpecializations(Address),
+    SpecializedArbitrators(RefundReasonCode, u64),
+    SpecializedArbitratorCount(RefundReasonCode),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -245,6 +249,8 @@ pub enum RefundReasonCode {
     Unauthorized,
     CustomerRequest,
     Other,
+    // Merchant-defined custom reason codes
+    Custom(u32),
 }
 
 // Issue #138 (recurred): the flat `Error` enum grew past Soroban's 50-variant
@@ -1005,6 +1011,71 @@ pub struct ArbitratorVote {
     pub voted_for_refund: bool,
     pub reasoning_hash: BytesN<32>,
     pub voted_at: u64,
+}
+
+// ── Merchant-defined custom reason codes ─────────────────────────────────────
+
+/// Merchant-defined custom refund reason code
+#[derive(Clone)]
+#[contracttype]
+pub struct MerchantReasonCode {
+    pub code_id: u32,
+    pub merchant: Address,
+    pub label: String,
+    pub description: String,
+    pub created_at: u64,
+    pub active: bool,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReasonCodeDefined {
+    pub merchant: Address,
+    pub code_id: u32,
+    pub label: String,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReasonCodeUpdated {
+    pub merchant: Address,
+    pub code_id: u32,
+    pub label: String,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReasonCodeDeactivated {
+    pub merchant: Address,
+    pub code_id: u32,
+}
+
+// ── Arbitrator specialization by reason code ─────────────────────────────────
+
+/// Arbitrator's specialization in handling specific refund reason codes
+#[derive(Clone)]
+#[contracttype]
+pub struct ArbitratorSpecialization {
+    pub arbitrator: Address,
+    pub reason_codes: Vec<RefundReasonCode>,
+    pub expertise_level: u32,
+    pub updated_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArbitratorSpecializationSet {
+    pub arbitrator: Address,
+    pub reason_code_count: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SpecializedArbitratorAssigned {
+    pub case_id: u64,
+    pub arbitrator: Address,
+    pub reason_code: RefundReasonCode,
+    pub expertise_level: u32,
 }
 
 #[derive(Clone)]
