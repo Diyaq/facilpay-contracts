@@ -51,6 +51,8 @@ pub enum ConfigKey {
     MaxForwardDepth,
     // Issue #669: reject payments to unregistered or deactivated merchants
     RequireRegisteredMerchants,
+    // Issue #809: refund contract allowed to call `record_refund`
+    RefundContract,
 }
 
 #[derive(Clone)]
@@ -81,6 +83,8 @@ pub enum PaymentKey {
     // Issue #662: merchant-initiated payment requests
     RequestCounter,
     Request(u64),
+    // Issue #809: refund-contract refund ids already applied to a payment
+    RefundSynced(u64),
 }
 
 pub const MAX_MEMO_VERSIONS: u32 = 10;
@@ -234,6 +238,8 @@ pub enum PaymentError {
     MerchantNotRegistered = 241,
     MerchantInactive = 242,
     InvalidMerchantName = 243,
+    // Issue #809: refund sync from the refund contract
+    RefundContractNotSet = 244,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -398,7 +404,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
                     core::mem::transmute::<u32, SubscriptionError>(code)
                 }));
             }
-            if (200..=243).contains(&code) {
+            if (200..=244).contains(&code) {
                 return Ok(Error::Payment(unsafe {
                     core::mem::transmute::<u32, PaymentError>(code)
                 }));
@@ -884,6 +890,10 @@ pub enum TestError {
     // Arithmetic safety
     BillingOverflow = 124,
     InvalidInterval = 125,
+    // Subscription transfer
+    SubscriptionTransferNotAllowed = 126,
+    InvalidTransferRecipient = 127,
+    SubscriptionNotTransferable = 128,
 }
 
 // Manual trait implementations replacing #[contracterror] (105 variants exceed the 50-variant XDR spec limit)
@@ -1107,6 +1117,39 @@ pub struct RequireRegisteredMerchantsSet {
     pub admin: Address,
 }
 
+// Reusable payment link events
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentLinkCreated {
+    pub link_id: u64,
+    pub merchant: Address,
+    pub amount: i128,
+    pub usage_cap: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentLinkUsed {
+    pub link_id: u64,
+    pub payment_id: u64,
+    pub customer: Address,
+    pub usage_count: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentLinkDeactivated {
+    pub link_id: u64,
+    pub merchant: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentLinkReactivated {
+    pub link_id: u64,
+    pub merchant: Address,
+}
+
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaymentCompleted {
@@ -1121,6 +1164,25 @@ pub struct PaymentRefunded {
     pub payment_id: u64,
     pub customer: Address,
     pub amount: i128,
+}
+
+/// Emitted when the registered refund contract records a processed refund (#809).
+#[contractevent]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PaymentRefundSynced {
+    pub payment_id: u64,
+    pub refund_id: u64,
+    pub amount: i128,
+    pub refunded_amount: i128,
+    pub status: PaymentStatus,
+}
+
+/// Emitted when the admin registers the refund contract (#809).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundContractSet {
+    pub refund_contract: Address,
+    pub set_by: Address,
 }
 
 #[contractevent]
@@ -1226,6 +1288,16 @@ pub struct RecurringPaymentFailed {
 pub struct SubscriptionCancelled {
     pub subscription_id: u64,
     pub cancelled_by: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionTransferred {
+    pub subscription_id: u64,
+    pub from_customer: Address,
+    pub to_customer: Address,
+    pub transferred_by: Address,
+    pub transferred_at: u64,
 }
 
 #[contractevent]
@@ -1740,6 +1812,39 @@ pub struct PaymentRequest {
     pub created_at: u64,
     /// Id of the payment created when the request was paid.
     pub payment_id: Option<u64>,
+}
+
+/// Status of a reusable payment link.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum PaymentLinkStatus {
+    Active,
+    Inactive,
+    Expired,
+}
+
+/// A reusable payment link with a usage cap.
+/// Allows merchants to create a link that can be used multiple times
+/// up to a specified limit before it expires or is deactivated.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct PaymentLink {
+    pub id: u64,
+    pub merchant: Address,
+    pub amount: i128,
+    pub token: Address,
+    pub currency: Currency,
+    /// Maximum number of times this link can be used (0 = unlimited).
+    pub usage_cap: u32,
+    /// Current number of times this link has been used.
+    pub usage_count: u32,
+    /// Ledger timestamp after which the link can no longer be used (0 = never).
+    pub expires_at: u64,
+    pub metadata: String,
+    pub description: String,
+    pub status: PaymentLinkStatus,
+    pub created_at: u64,
+    pub last_used_at: Option<u64>,
 }
 
 /// Maximum length, in bytes, of a registered merchant's display name (#669).
@@ -3293,6 +3398,243 @@ impl PaymentContract {
             .ok_or(Error::Payment(PaymentError::RequestNotFound))
     }
 
+    /// Creates a reusable payment link with a usage cap.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant creating the link (must authorize)
+    /// * `amount` - The payment amount (must be positive)
+    /// * `token` - The token address for payments
+    /// * `currency` - The currency type
+    /// * `usage_cap` - Maximum number of uses (0 = unlimited)
+    /// * `expiry_seconds` - Seconds until expiration (0 = never expires)
+    /// * `metadata` - Optional metadata string
+    /// * `description` - Description of what the link is for
+    ///
+    /// # Returns
+    /// The created link's ID, or an error if parameters are invalid.
+    pub fn create_payment_link(
+        env: Env,
+        merchant: Address,
+        amount: i128,
+        token: Address,
+        currency: Currency,
+        usage_cap: u32,
+        expiry_seconds: u64,
+        metadata: String,
+        description: String,
+    ) -> Result<u64, Error> {
+        merchant.require_auth();
+        Self::require_not_paused(&env, "create_payment_link")?;
+
+        if amount <= 0 {
+            return Err(Error::Payment(PaymentError::InvalidPaymentLinkAmount));
+        }
+
+        // Get and increment counter
+        let counter_key = DataKey::Payment(PaymentKey::PaymentLinkCounter);
+        let link_id: u64 = env.store().get(&counter_key).unwrap_or(0) + 1;
+        env.store().set(&counter_key, &link_id);
+
+        let current_time = env.ledger().timestamp();
+        let expires_at = if expiry_seconds > 0 {
+            current_time + expiry_seconds
+        } else {
+            0
+        };
+
+        let link = PaymentLink {
+            id: link_id,
+            merchant: merchant.clone(),
+            amount,
+            token,
+            currency,
+            usage_cap,
+            usage_count: 0,
+            expires_at,
+            metadata,
+            description,
+            status: PaymentLinkStatus::Active,
+            created_at: current_time,
+            last_used_at: None,
+        };
+
+        env.store()
+            .set(&DataKey::Payment(PaymentKey::PaymentLink(link_id)), &link);
+
+        PaymentLinkCreated {
+            link_id,
+            merchant,
+            amount,
+            usage_cap,
+        }
+        .publish(&env);
+
+        Ok(link_id)
+    }
+
+    /// Uses a payment link to create a payment.
+    ///
+    /// # Arguments
+    /// * `customer` - The customer making the payment (must authorize)
+    /// * `link_id` - The payment link to use
+    ///
+    /// # Returns
+    /// The created payment's ID, or an error if the link is inactive, expired,
+    /// or has reached its usage cap.
+    pub fn use_payment_link(
+        env: Env,
+        customer: Address,
+        link_id: u64,
+    ) -> Result<u64, Error> {
+        customer.require_auth();
+        Self::require_not_paused(&env, "use_payment_link")?;
+        Self::require_not_paused(&env, "create_payment")?;
+
+        let link_key = DataKey::Payment(PaymentKey::PaymentLink(link_id));
+        let mut link: PaymentLink = env
+            .store()
+            .get(&link_key)
+            .ok_or(Error::Payment(PaymentError::PaymentLinkNotFound))?;
+
+        // Check link status
+        if link.status != PaymentLinkStatus::Active {
+            return Err(Error::Payment(PaymentError::PaymentLinkInactive));
+        }
+
+        // Check expiration
+        let current_time = env.ledger().timestamp();
+        if link.expires_at > 0 && current_time >= link.expires_at {
+            link.status = PaymentLinkStatus::Expired;
+            env.store().set(&link_key, &link);
+            return Err(Error::Payment(PaymentError::PaymentLinkExpired));
+        }
+
+        // Check usage cap
+        if link.usage_cap > 0 && link.usage_count >= link.usage_cap {
+            return Err(Error::Payment(PaymentError::PaymentLinkUsageCapReached));
+        }
+
+        // Create payment using the link details
+        let payment_id = Self::create_payment(
+            env.clone(),
+            customer.clone(),
+            link.merchant.clone(),
+            link.amount,
+            link.token.clone(),
+            link.currency.clone(),
+            0, // no expiry on the payment itself
+            link.metadata.clone(),
+            String::from_str(&env, ""),
+        )?;
+
+        // Update link usage
+        link.usage_count += 1;
+        link.last_used_at = Some(current_time);
+        env.store().set(&link_key, &link);
+
+        PaymentLinkUsed {
+            link_id,
+            payment_id,
+            customer,
+            usage_count: link.usage_count,
+        }
+        .publish(&env);
+
+        Ok(payment_id)
+    }
+
+    /// Deactivates a payment link so it can no longer be used.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant that created the link (must authorize)
+    /// * `link_id` - The link to deactivate
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or an error if the link doesn't exist or the
+    /// caller is not its merchant.
+    pub fn deactivate_payment_link(
+        env: Env,
+        merchant: Address,
+        link_id: u64,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+
+        let link_key = DataKey::Payment(PaymentKey::PaymentLink(link_id));
+        let mut link: PaymentLink = env
+            .store()
+            .get(&link_key)
+            .ok_or(Error::Payment(PaymentError::PaymentLinkNotFound))?;
+
+        if link.merchant != merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        link.status = PaymentLinkStatus::Inactive;
+        env.store().set(&link_key, &link);
+
+        PaymentLinkDeactivated {
+            link_id,
+            merchant,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Reactivates a payment link so it can be used again.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant that created the link (must authorize)
+    /// * `link_id` - The link to reactivate
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or an error if the link doesn't exist, the
+    /// caller is not its merchant, or the link is expired.
+    pub fn reactivate_payment_link(
+        env: Env,
+        merchant: Address,
+        link_id: u64,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+
+        let link_key = DataKey::Payment(PaymentKey::PaymentLink(link_id));
+        let mut link: PaymentLink = env
+            .store()
+            .get(&link_key)
+            .ok_or(Error::Payment(PaymentError::PaymentLinkNotFound))?;
+
+        if link.merchant != merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        // Can't reactivate expired links
+        let current_time = env.ledger().timestamp();
+        if link.expires_at > 0 && current_time >= link.expires_at {
+            return Err(Error::Payment(PaymentError::PaymentLinkExpired));
+        }
+
+        link.status = PaymentLinkStatus::Active;
+        env.store().set(&link_key, &link);
+
+        PaymentLinkReactivated {
+            link_id,
+            merchant,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Returns a payment link by id.
+    ///
+    /// # Returns
+    /// The `PaymentLink`, or `PaymentLinkNotFound` if it does not exist.
+    pub fn get_payment_link(env: Env, link_id: u64) -> Result<PaymentLink, Error> {
+        env.store()
+            .get(&DataKey::Payment(PaymentKey::PaymentLink(link_id)))
+            .ok_or(Error::Payment(PaymentError::PaymentLinkNotFound))
+    }
+
     /// Adds a fee-exempt tip for the merchant to a pending payment (#675).
     ///
     /// The tip is transferred from the customer into the contract immediately
@@ -3350,7 +3692,7 @@ impl PaymentContract {
 
         token::Client::new(&env, &payment.token).transfer(
             &customer,
-            env.current_contract_address(),
+            &env.current_contract_address(),
             &tip_amount,
         );
         let total_tip = PaymentContract::get_tip(&env, payment_id) + tip_amount;
@@ -5927,6 +6269,143 @@ impl PaymentContract {
         Ok(())
     }
 
+    /// Registers the refund contract allowed to call `record_refund` (#809).
+    ///
+    /// # Arguments
+    /// * `admin` - The contract admin (must authorize)
+    /// * `refund_contract` - Address of the refund contract
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `BasicError::Unauthorized` if `admin` is not the
+    /// contract admin.
+    pub fn set_refund_contract(
+        env: Env,
+        admin: Address,
+        refund_contract: Address,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .store()
+            .get(&DataKey::Config(ConfigKey::Admin))
+            .ok_or(Error::Basic(BasicError::Unauthorized))?;
+        if admin != stored_admin {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        env.store().set(
+            &DataKey::Config(ConfigKey::RefundContract),
+            &refund_contract,
+        );
+        (RefundContractSet {
+            refund_contract,
+            set_by: admin,
+        })
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Returns the registered refund contract, if any (#809).
+    pub fn get_refund_contract(env: Env) -> Option<Address> {
+        env.store().get(&DataKey::Config(ConfigKey::RefundContract))
+    }
+
+    /// Records a refund processed by the registered refund contract (#809).
+    ///
+    /// Adds `amount` to the payment's `refunded_amount` and moves a `Completed`
+    /// payment to `PartialRefunded`, or to `Refunded` once the full amount has
+    /// been refunded. Funds are not moved: the refund contract has already
+    /// paid the customer.
+    ///
+    /// # Arguments
+    /// * `refund_contract` - The calling refund contract (must authorize and be registered)
+    /// * `payment_id` - The payment the refund belongs to
+    /// * `refund_id` - The refund contract's refund id, applied at most once
+    /// * `amount` - The refunded amount in base token units
+    ///
+    /// # Returns
+    /// `Ok(())` on success. Errors: `PaymentError::RefundContractNotSet` if no
+    /// refund contract is registered, `BasicError::Unauthorized` if the caller is
+    /// not the registered refund contract, `BasicError::InvalidAmount` if
+    /// `amount <= 0`, `PaymentError::NotFound`, `PaymentError::AlreadyProcessed`
+    /// if `refund_id` was already recorded or the payment is fully refunded,
+    /// `PaymentError::InvalidStatus` if the payment is not `Completed` or
+    /// `PartialRefunded`, and `PaymentError::RefundExceedsPayment` if the total
+    /// refunded would exceed the payment amount.
+    pub fn record_refund(
+        env: Env,
+        refund_contract: Address,
+        payment_id: u64,
+        refund_id: u64,
+        amount: i128,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "record_refund")?;
+        let registered: Address = env
+            .store()
+            .get(&DataKey::Config(ConfigKey::RefundContract))
+            .ok_or(Error::Payment(PaymentError::RefundContractNotSet))?;
+        if refund_contract != registered {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        refund_contract.require_auth();
+
+        if amount <= 0 {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+        let synced_key = DataKey::Payment(PaymentKey::RefundSynced(refund_id));
+        if env.store().has(&synced_key) {
+            return Err(Error::Payment(PaymentError::AlreadyProcessed));
+        }
+
+        let mut payment: Payment = env
+            .store()
+            .get(&DataKey::Payment(PaymentKey::Data(payment_id)))
+            .ok_or(Error::Payment(PaymentError::NotFound))?;
+        match payment.status {
+            PaymentStatus::Completed | PaymentStatus::PartialRefunded => {}
+            PaymentStatus::Refunded => return Err(Error::Payment(PaymentError::AlreadyProcessed)),
+            PaymentStatus::Pending | PaymentStatus::Cancelled => {
+                return Err(Error::Payment(PaymentError::InvalidStatus))
+            }
+        }
+
+        let new_refunded = payment
+            .refunded_amount
+            .checked_add(amount)
+            .ok_or(Error::Payment(PaymentError::RefundExceedsPayment))?;
+        if new_refunded > payment.amount {
+            return Err(Error::Payment(PaymentError::RefundExceedsPayment));
+        }
+        let previous_status = payment.status.clone();
+        payment.refunded_amount = new_refunded;
+        payment.status = if new_refunded == payment.amount {
+            PaymentStatus::Refunded
+        } else {
+            PaymentStatus::PartialRefunded
+        };
+
+        env.store()
+            .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        env.store().set(&synced_key, &payment_id);
+        if payment.status != previous_status {
+            PaymentContract::record_status_change(
+                &env,
+                payment_id,
+                payment.status.clone(),
+                refund_contract,
+            );
+        }
+
+        (PaymentRefundSynced {
+            payment_id,
+            refund_id,
+            amount,
+            refunded_amount: new_refunded,
+            status: payment.status,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
     /// Cancels a pending payment.
     ///
     /// # Arguments
@@ -6419,6 +6898,61 @@ impl PaymentContract {
                 MerchantDataKey::MerchantActiveSubscriptions(merchant, page),
             ))
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    fn add_to_customer_subscriptions(env: &Env, customer: &Address, subscription_id: u64) {
+        let count: u64 = env
+            .store()
+            .get(&DataKey::Customer(CustomerDataKey::SubscriptionCount(
+                customer.clone(),
+            )))
+            .unwrap_or(0);
+        
+        let page = count / 100;
+        let page_index = count % 100;
+        
+        let key = DataKey::Customer(CustomerDataKey::Subscriptions(customer.clone(), page));
+        let mut page_subs: Vec<u64> = env.store().get(&key).unwrap_or_else(|| Vec::new(env));
+        page_subs.push_back(subscription_id);
+        env.store().set(&key, &page_subs);
+        
+        env.store().set(
+            &DataKey::Customer(CustomerDataKey::SubscriptionCount(customer.clone())),
+            &(count + 1),
+        );
+    }
+
+    fn remove_from_customer_subscriptions(env: &Env, customer: &Address, subscription_id: u64) {
+        let count: u64 = env
+            .store()
+            .get(&DataKey::Customer(CustomerDataKey::SubscriptionCount(
+                customer.clone(),
+            )))
+            .unwrap_or(0);
+        
+        if count == 0 {
+            return;
+        }
+
+        // Linear search through pages to find and remove the subscription
+        for page in 0..=((count - 1) / 100) {
+            let key = DataKey::Customer(CustomerDataKey::Subscriptions(customer.clone(), page));
+            if let Some(mut page_subs): Option<Vec<u64>> = env.store().get(&key) {
+                if let Some(pos) = page_subs.iter().position(|&id| id == subscription_id) {
+                    page_subs.remove(pos as u32);
+                    if page_subs.is_empty() {
+                        env.store().remove(&key);
+                    } else {
+                        env.store().set(&key, &page_subs);
+                    }
+                    env.store().set(
+                        &DataKey::Customer(CustomerDataKey::SubscriptionCount(customer.clone())),
+                        &(count - 1),
+                    );
+                    return;
+                }
+            }
+        }
     }
 
     fn is_valid_currency(currency: &Currency) -> bool {
@@ -7503,6 +8037,108 @@ impl PaymentContract {
         (SubscriptionCancelled {
             subscription_id,
             cancelled_by: caller,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Transfer a subscription to another customer.
+    ///
+    /// Allows the current customer to transfer their subscription to a new customer.
+    /// The merchant can also authorize the transfer if needed.
+    ///
+    /// # Arguments
+    /// * `caller` - The current customer or merchant authorizing the transfer.
+    /// * `subscription_id` - The ID of the subscription to transfer.
+    /// * `new_customer` - The address of the new customer to receive the subscription.
+    ///
+    /// # Errors
+    /// Returns `SubscriptionNotFound` if the subscription doesn't exist.
+    /// Returns `Unauthorized` if the caller is neither the customer nor the merchant.
+    /// Returns `InvalidStatus` if the subscription is cancelled or expired.
+    /// Returns `InvalidTransferRecipient` if the new customer is the same as the current customer.
+    /// Returns `SubscriptionNotTransferable` if the subscription is in dunning or suspended status.
+    pub fn transfer_subscription(
+        env: Env,
+        caller: Address,
+        subscription_id: u64,
+        new_customer: Address,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+
+        if !env
+            .store()
+            .has(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
+        {
+            return Err(Error::Subscription(SubscriptionError::NotFound));
+        }
+
+        let mut sub: Subscription = env
+            .store()
+            .get(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
+            .unwrap();
+
+        // Only customer or merchant can transfer
+        let is_authorized = sub.customer == caller || sub.merchant == caller;
+        if !is_authorized {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        // Cannot transfer cancelled or expired subscriptions
+        if sub.status == SubscriptionStatus::Cancelled || sub.status == SubscriptionStatus::Expired
+        {
+            return Err(Error::Payment(PaymentError::InvalidStatus));
+        }
+
+        // Cannot transfer subscriptions in dunning or suspended status
+        if sub.status == SubscriptionStatus::InDunning
+            || sub.status == SubscriptionStatus::Suspended
+        {
+            return Err(Error::Payment(PaymentError::SubscriptionNotTransferable));
+        }
+
+        // New customer must be different from current customer
+        if sub.customer == new_customer {
+            return Err(Error::Payment(PaymentError::InvalidTransferRecipient));
+        }
+
+        let old_customer = sub.customer.clone();
+
+        // Update subscription with new customer
+        sub.customer = new_customer.clone();
+        env.store().set(
+            &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
+            &sub,
+        );
+
+        // Update customer subscription indices
+        // Remove from old customer's subscription list
+        Self::remove_from_customer_subscriptions(&env, &old_customer, subscription_id);
+
+        // Add to new customer's subscription list
+        Self::add_to_customer_subscriptions(&env, &new_customer, subscription_id);
+
+        // Transfer any dunning state to new customer if it exists
+        if let Some(dunning_state): Option<DunningState> = env.store().get(&DataKey::Subscription(
+            SubscriptionKey::DunningState(subscription_id),
+        )) {
+            env.store().remove(&DataKey::Subscription(
+                SubscriptionKey::DunningState(subscription_id),
+            ));
+            // Clear dunning for clean transfer
+        }
+
+        (SubscriptionTransferred {
+            subscription_id,
+            from_customer: old_customer,
+            to_customer: new_customer,
+            transferred_by: caller,
+            transferred_at: env.ledger().timestamp(),
         })
         .publish(&env);
 
@@ -15524,3 +16160,6 @@ mod test_merchant_registry;
 
 #[cfg(test)]
 mod test_mandates;
+
+#[cfg(test)]
+mod test_refund_sync;

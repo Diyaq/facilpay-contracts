@@ -16,6 +16,9 @@ pub const PROPOSAL_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 /// Upper bound on the size of the admin set, to bound approval-counting cost.
 pub const MAX_ADMINS: u32 = 20;
 
+/// Maximum number of entries `get_incident_log` returns per page (#818).
+pub const MAX_INCIDENT_PAGE: u32 = 50;
+
 #[contracterror]
 #[derive(Clone, Debug, PartialEq)]
 pub enum Error {
@@ -61,6 +64,9 @@ pub enum DataKey {
     Proposal(u64),
     // #820: timestamp at which the current emergency pause may be expired.
     EmergencyPauseExpiry,
+    // #818: number of incident log entries and each entry by id (persistent).
+    IncidentCount,
+    Incident(u64),
 }
 
 /// A privileged coordinator action that goes through propose/approve/execute (#816).
@@ -184,6 +190,94 @@ pub struct EmergencyPauseExtended {
 pub struct EmergencyPauseAutoExpired {
     pub expires_at: u64,
     pub unpaused_at: u64,
+}
+
+/// Kind of emergency action recorded in the incident log (#818).
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IncidentAction {
+    PauseAll,
+    UnpauseAll,
+    ExtendPause,
+    PauseAutoExpired,
+    PauseFunction,
+    UnpauseFunction,
+}
+
+/// What an incident log entry acted on (#818).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IncidentTarget {
+    /// Every child contract (platform-wide pause / unpause / expiry).
+    AllChildren,
+    /// A single child contract.
+    Child(ChildKind),
+}
+
+/// One entry in the on-chain incident log (#818).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IncidentEntry {
+    /// Sequential id, starting at 1.
+    pub id: u64,
+    pub action: IncidentAction,
+    pub target: IncidentTarget,
+    /// The child function acted on, for function-level actions.
+    pub function: Option<String>,
+    /// The reason supplied with the action; empty when the action takes none.
+    pub reason: String,
+    /// Who performed the action, or `None` for a permissionless auto-expiry.
+    pub actor: Option<Address>,
+    /// Ledger timestamp of the action.
+    pub at: u64,
+}
+
+/// Emitted whenever an entry is appended to the incident log (#818).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IncidentLogged {
+    pub incident_id: u64,
+    pub action: IncidentAction,
+    pub at: u64,
+}
+
+/// Appends an entry to the persistent incident log and emits `IncidentLogged`.
+fn log_incident(
+    env: &Env,
+    action: IncidentAction,
+    target: IncidentTarget,
+    function: Option<String>,
+    reason: String,
+    actor: Option<Address>,
+) {
+    let id = incident_count(env) + 1;
+    let at = env.ledger().timestamp();
+    let entry = IncidentEntry {
+        id,
+        action,
+        target,
+        function,
+        reason,
+        actor,
+        at,
+    };
+    env.storage()
+        .persistent()
+        .set(&DataKey::Incident(id), &entry);
+    env.storage().persistent().set(&DataKey::IncidentCount, &id);
+    IncidentLogged {
+        incident_id: id,
+        action,
+        at,
+    }
+    .publish(env);
+}
+
+fn incident_count(env: &Env) -> u64 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::IncidentCount)
+        .unwrap_or(0)
 }
 
 /// Verifies `pauser` is authenticated and matches the stored pauser.
@@ -500,6 +594,15 @@ impl AdminContract {
                 .remove(&DataKey::EmergencyPauseExpiry),
         }
 
+        log_incident(
+            &env,
+            IncidentAction::PauseAll,
+            IncidentTarget::AllChildren,
+            None,
+            reason,
+            Some(pauser),
+        );
+
         Ok(())
     }
 
@@ -521,6 +624,14 @@ impl AdminContract {
         env.storage()
             .instance()
             .remove(&DataKey::EmergencyPauseExpiry);
+        log_incident(
+            &env,
+            IncidentAction::UnpauseAll,
+            IncidentTarget::AllChildren,
+            None,
+            String::from_str(&env, ""),
+            Some(pauser),
+        );
         Ok(())
     }
 
@@ -564,11 +675,19 @@ impl AdminContract {
             .set(&DataKey::EmergencyPauseExpiry, &new_expires_at);
 
         EmergencyPauseExtended {
-            extended_by: admin,
+            extended_by: admin.clone(),
             previous_expires_at: expires_at,
             new_expires_at,
         }
         .publish(&env);
+        log_incident(
+            &env,
+            IncidentAction::ExtendPause,
+            IncidentTarget::AllChildren,
+            None,
+            String::from_str(&env, ""),
+            Some(admin),
+        );
 
         Ok(new_expires_at)
     }
@@ -608,6 +727,14 @@ impl AdminContract {
             unpaused_at: now,
         }
         .publish(&env);
+        log_incident(
+            &env,
+            IncidentAction::PauseAutoExpired,
+            IncidentTarget::AllChildren,
+            None,
+            String::from_str(&env, ""),
+            None,
+        );
 
         Ok(())
     }
@@ -616,6 +743,34 @@ impl AdminContract {
     /// no bounded pause is in effect (#820).
     pub fn get_emergency_pause_expiry(env: Env) -> Option<u64> {
         env.storage().instance().get(&DataKey::EmergencyPauseExpiry)
+    }
+
+    /// Returns a page of the incident log, oldest entry first (#818).
+    ///
+    /// # Parameters
+    /// - `offset`: number of entries to skip from the start of the log.
+    /// - `limit`: maximum number of entries to return, capped at `MAX_INCIDENT_PAGE`.
+    ///
+    /// # Returns
+    /// Up to `limit` entries; empty when `offset` is past the end or `limit` is 0.
+    pub fn get_incident_log(env: Env, offset: u64, limit: u32) -> Vec<IncidentEntry> {
+        let mut page = Vec::new(&env);
+        let total = incident_count(&env);
+        let limit = u64::from(limit.min(MAX_INCIDENT_PAGE));
+        let end = offset.saturating_add(limit).min(total);
+        let mut id = offset.saturating_add(1);
+        while id <= end {
+            if let Some(entry) = env.storage().persistent().get(&DataKey::Incident(id)) {
+                page.push_back(entry);
+            }
+            id += 1;
+        }
+        page
+    }
+
+    /// Returns the total number of entries in the incident log (#818).
+    pub fn get_incident_count(env: Env) -> u64 {
+        incident_count(&env)
     }
 
     /// Pauses a single function on one child contract, leaving every other
@@ -670,12 +825,20 @@ impl AdminContract {
 
         EmergencyFunctionPausedEvent {
             target,
-            function_name,
-            paused_by: pauser,
-            reason,
+            function_name: function_name.clone(),
+            paused_by: pauser.clone(),
+            reason: reason.clone(),
             paused_at: env.ledger().timestamp(),
         }
         .publish(&env);
+        log_incident(
+            &env,
+            IncidentAction::PauseFunction,
+            IncidentTarget::Child(target),
+            Some(function_name),
+            reason,
+            Some(pauser),
+        );
 
         Ok(())
     }
@@ -723,11 +886,19 @@ impl AdminContract {
 
         EmergencyFunctionUnpausedEvent {
             target,
-            function_name,
-            unpaused_by: pauser,
+            function_name: function_name.clone(),
+            unpaused_by: pauser.clone(),
             unpaused_at: env.ledger().timestamp(),
         }
         .publish(&env);
+        log_incident(
+            &env,
+            IncidentAction::UnpauseFunction,
+            IncidentTarget::Child(target),
+            Some(function_name),
+            String::from_str(&env, ""),
+            Some(pauser),
+        );
 
         Ok(())
     }
@@ -751,7 +922,15 @@ impl AdminContract {
 
         env.storage()
             .instance()
-            .set(&DataKey::PaymentContract, &payment_contract);
+            .set(&DataKey::PaymentContract, &payment_contract.clone());
+
+        ChildContractUpdated {
+            child_kind: ChildKind::Payment,
+            new_address: payment_contract,
+            updated_by: admin,
+            updated_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -775,7 +954,15 @@ impl AdminContract {
 
         env.storage()
             .instance()
-            .set(&DataKey::EscrowContract, &escrow_contract);
+            .set(&DataKey::EscrowContract, &escrow_contract.clone());
+
+        ChildContractUpdated {
+            child_kind: ChildKind::Escrow,
+            new_address: escrow_contract,
+            updated_by: admin,
+            updated_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -799,7 +986,15 @@ impl AdminContract {
 
         env.storage()
             .instance()
-            .set(&DataKey::RefundContract, &refund_contract);
+            .set(&DataKey::RefundContract, &refund_contract.clone());
+
+        ChildContractUpdated {
+            child_kind: ChildKind::Refund,
+            new_address: refund_contract,
+            updated_by: admin,
+            updated_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -1896,5 +2091,145 @@ mod test {
         client.emergency_unpause_all(&pauser);
         client.emergency_pause_all(&pauser, &reason, &None);
         assert_eq!(client.get_emergency_pause_expiry(), None);
+    }
+
+    // ── #818: incident log ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_incident_log_records_every_emergency_action() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        set_time(&env, 1_000);
+        let (client, admin, pauser, _, _, _) = setup_initialized(&env);
+        let reason = String::from_str(&env, "incident");
+        let empty = String::from_str(&env, "");
+        let function = String::from_str(&env, "process_refund");
+
+        assert_eq!(client.get_incident_count(), 0);
+        assert_eq!(client.get_incident_log(&0, &10).len(), 0);
+
+        client.emergency_pause_function(&pauser, &ChildKind::Refund, &function, &reason);
+        client.emergency_unpause_function(&pauser, &ChildKind::Refund, &function);
+        client.emergency_pause_all(&pauser, &reason, &Some(PAUSE_SECONDS));
+        set_time(&env, 1_100);
+        client.extend_emergency_pause(&admin, &PAUSE_SECONDS);
+        set_time(&env, 1_000 + 2 * PAUSE_SECONDS);
+        client.expire_emergency_pause();
+        client.emergency_pause_all(&pauser, &reason, &None);
+        client.emergency_unpause_all(&pauser);
+        assert!(has_event(&env, "incident_logged"));
+
+        assert_eq!(client.get_incident_count(), 7);
+        let log = client.get_incident_log(&0, &10);
+        assert_eq!(log.len(), 7);
+
+        assert_eq!(
+            log.get(0).unwrap(),
+            IncidentEntry {
+                id: 1,
+                action: IncidentAction::PauseFunction,
+                target: IncidentTarget::Child(ChildKind::Refund),
+                function: Some(function.clone()),
+                reason: reason.clone(),
+                actor: Some(pauser.clone()),
+                at: 1_000,
+            }
+        );
+        let unpause_fn = log.get(1).unwrap();
+        assert_eq!(unpause_fn.action, IncidentAction::UnpauseFunction);
+        assert_eq!(unpause_fn.function, Some(function));
+        assert_eq!(unpause_fn.reason, empty);
+
+        let pause_all = log.get(2).unwrap();
+        assert_eq!(pause_all.action, IncidentAction::PauseAll);
+        assert_eq!(pause_all.target, IncidentTarget::AllChildren);
+        assert_eq!(pause_all.function, None);
+        assert_eq!(pause_all.reason, reason);
+
+        let extend = log.get(3).unwrap();
+        assert_eq!(extend.action, IncidentAction::ExtendPause);
+        assert_eq!(extend.actor, Some(admin));
+        assert_eq!(extend.at, 1_100);
+
+        let expired = log.get(4).unwrap();
+        assert_eq!(expired.action, IncidentAction::PauseAutoExpired);
+        assert_eq!(expired.actor, None);
+        assert_eq!(expired.at, 1_000 + 2 * PAUSE_SECONDS);
+
+        assert_eq!(log.get(5).unwrap().action, IncidentAction::PauseAll);
+        assert_eq!(log.get(6).unwrap().action, IncidentAction::UnpauseAll);
+        for (i, entry) in log.iter().enumerate() {
+            assert_eq!(entry.id, i as u64 + 1);
+        }
+    }
+
+    #[test]
+    fn test_incident_log_is_paginated_and_persistent() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _, pauser, _, _, _) = setup_initialized(&env);
+        let reason = String::from_str(&env, "incident");
+
+        for _ in 0..30 {
+            client.emergency_pause_all(&pauser, &reason, &None);
+            client.emergency_unpause_all(&pauser);
+        }
+        assert_eq!(client.get_incident_count(), 60);
+
+        let first = client.get_incident_log(&0, &5);
+        assert_eq!(first.len(), 5);
+        assert_eq!(first.get(0).unwrap().id, 1);
+        assert_eq!(first.get(4).unwrap().id, 5);
+
+        let middle = client.get_incident_log(&5, &3);
+        assert_eq!(middle.len(), 3);
+        assert_eq!(middle.get(0).unwrap().id, 6);
+
+        // The tail page is truncated at the end of the log.
+        let tail = client.get_incident_log(&58, &10);
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail.get(1).unwrap().id, 60);
+
+        // Past the end, zero limit and oversized limits.
+        assert_eq!(client.get_incident_log(&60, &10).len(), 0);
+        assert_eq!(client.get_incident_log(&u64::MAX, &10).len(), 0);
+        assert_eq!(client.get_incident_log(&0, &0).len(), 0);
+        assert_eq!(
+            client.get_incident_log(&0, &u32::MAX).len(),
+            MAX_INCIDENT_PAGE
+        );
+
+        // Entries live in persistent storage, not instance storage.
+        env.as_contract(&client.address, || {
+            assert!(env.storage().persistent().has(&DataKey::Incident(1)));
+            assert!(env.storage().persistent().has(&DataKey::IncidentCount));
+            assert!(!env.storage().instance().has(&DataKey::Incident(1)));
+        });
+    }
+
+    #[test]
+    fn test_rejected_emergency_actions_are_not_logged() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, pauser, _, _, _) = setup_initialized(&env);
+        let reason = String::from_str(&env, "incident");
+
+        assert!(client
+            .try_emergency_pause_all(&admin, &reason, &None)
+            .is_err());
+        assert!(client
+            .try_emergency_pause_all(&pauser, &reason, &Some(0))
+            .is_err());
+        assert!(client
+            .try_emergency_pause_function(
+                &pauser,
+                &ChildKind::Payment,
+                &String::from_str(&env, ""),
+                &reason
+            )
+            .is_err());
+        assert!(client.try_expire_emergency_pause().is_err());
+        assert_eq!(client.get_incident_count(), 0);
+        assert_eq!(client.get_incident_log(&0, &10).len(), 0);
     }
 }
