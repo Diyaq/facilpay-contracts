@@ -62,6 +62,8 @@ Every privileged function performs two authorization checks:
 | `get_threshold()` | The signature threshold. `NotInitialized` before `initialize`. | `u32` |
 | `get_proposal(proposal_id)` | A proposal by id. `ProposalNotFound` if unknown. | `AdminProposal` |
 | `get_emergency_pause_expiry()` | When the current bounded pause may be expired, or `None` if no bounded pause is in effect. | `Option<u64>` |
+| `get_incident_log(offset, limit)` | A page of the emergency-action incident log, oldest first. See [Incident Log](#incident-log). | `Vec<IncidentEntry>` |
+| `get_incident_count()` | Total number of incident log entries. | `u64` |
 | `get_schema_version()` | The coordinator's own schema version (`ADMIN_SCHEMA_VERSION`). | `u32` |
 | `get_platform_versions()` | The coordinator's version and each child's `get_schema_version`. See [Platform Versions](#platform-versions). | `PlatformVersions` |
 | `get_platform_status()` | Returns the current pause state of all three child contracts. If a child contract is unreachable, it is reported as `Unknown` rather than causing a panic. | `PlatformStatus` containing the address and pause status of each child. |
@@ -284,6 +286,52 @@ In addition to the child contract's own `FunctionPausedEvent` / `FunctionUnpause
 |---|---|---|
 | `EmergencyFunctionPausedEvent` | `target: ChildKind`, `function_name: String`, `paused_by: Address`, `reason: String`, `paused_at: u64` | `emergency_pause_function` |
 | `EmergencyFunctionUnpausedEvent` | `target: ChildKind`, `function_name: String`, `unpaused_by: Address`, `unpaused_at: u64` | `emergency_unpause_function` |
+
+## Incident Log
+
+Post-incident reviews need a lasting record of every emergency action. The coordinator appends an `IncidentEntry` to a log in **persistent storage** each time one of these succeeds:
+
+| Function | `action` | `target` | `function` | `reason` | `actor` |
+|---|---|---|---|---|---|
+| `emergency_pause_all` | `PauseAll` | `AllChildren` | `None` | the supplied reason | `Some(pauser)` |
+| `emergency_unpause_all` | `UnpauseAll` | `AllChildren` | `None` | empty | `Some(pauser)` |
+| `extend_emergency_pause` | `ExtendPause` | `AllChildren` | `None` | empty | `Some(admin)` |
+| `expire_emergency_pause` | `PauseAutoExpired` | `AllChildren` | `None` | empty | `None` (anyone may call it) |
+| `emergency_pause_function` | `PauseFunction` | `Child(target)` | `Some(function_name)` | the supplied reason | `Some(pauser)` |
+| `emergency_unpause_function` | `UnpauseFunction` | `Child(target)` | `Some(function_name)` | empty | `Some(pauser)` |
+
+Calls that fail (wrong caller, invalid arguments, a child rejecting the call) revert and leave no entry. Entries are never edited or removed.
+
+### `IncidentEntry`
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | `u64` | Sequential ID, starting at 1. |
+| `action` | `IncidentAction` | `PauseAll`, `UnpauseAll`, `ExtendPause`, `PauseAutoExpired`, `PauseFunction` or `UnpauseFunction`. |
+| `target` | `IncidentTarget` | `AllChildren` for platform-wide actions, or `Child(ChildKind)` for function-level ones. |
+| `function` | `Option<String>` | The child function, for function-level actions. |
+| `reason` | `String` | The reason supplied with the action, or empty if the action takes none. |
+| `actor` | `Option<Address>` | Who performed the action. `None` for a permissionless auto-expiry. |
+| `at` | `u64` | Ledger timestamp of the action. |
+
+### `get_incident_log(offset, limit) -> Vec<IncidentEntry>`
+
+| Parameter | Type | Description |
+|---|---|---|
+| `offset` | `u64` | Number of entries to skip from the oldest. |
+| `limit` | `u32` | Maximum number of entries to return. Capped at `MAX_INCIDENT_PAGE` (50). |
+
+Returns entries in ID order. Returns an empty vector when `offset >= get_incident_count()` or `limit` is 0. Read-only, needs no authorization, and has no errors. To read the whole log, page with `offset += limit` until fewer than `limit` entries come back.
+
+### `get_incident_count() -> u64`
+
+The number of entries in the log. Read-only, no errors.
+
+### Events
+
+| Event | Fields | Emitted by |
+|---|---|---|
+| `IncidentLogged` | `incident_id: u64`, `action: IncidentAction`, `at: u64` | Every function that appends an entry, after its own event |
 
 ## Security Considerations
 

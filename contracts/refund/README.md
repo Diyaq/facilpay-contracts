@@ -311,6 +311,36 @@ Emits `CounterOfferMade` from `counter_offer`. Emits `CounterOfferAccepted` and 
 - `get_payment_contract_address()` — Gets the payment contract address.
 - `verify_payment_ownership()` — Cross-contract call to verify customer owns the payment.
 
+#### Syncing processed refunds to the payment contract (#809)
+
+After `process_refund()` pays out a refund, the contract calls `record_refund(refund_contract, payment_id, refund_id, amount)` on the payment contract. This sets the payment's `refunded_amount` and moves its status to `PartialRefunded` or `Refunded`. The same applies to every path that processes a refund: `process_refund_batch()`, `evaluate_auto_refund()` and `resolve_appeal()` when it approves an appeal. On the payment contract, the admin must first register this contract with `set_refund_contract`. `amount` is the gross refund amount, before the platform fee.
+
+The sync never reverts a payout:
+
+- If no payment contract address is set, the sync is skipped and `RefundPaymentSyncFailed` is emitted with `payment_contract_set: false`.
+- If the payment contract rejects the call, `RefundPaymentSyncFailed` is emitted with `payment_contract_set: true`. This happens, for example, when this contract is not registered there or the payment contract is paused.
+
+In both cases the refund stays `Processed` and the customer keeps the funds. Once the problem is fixed, call `retry_refund_sync()`.
+
+| Function | Parameters | Returns |
+| --- | --- | --- |
+| `retry_refund_sync` | `refund_id: u64` | `Result<bool, Error>`: `true` if the payment contract accepted the update, `false` if it rejected it again (emits `RefundPaymentSyncFailed`) |
+| `is_refund_synced` | `refund_id: u64` | `bool`: whether the refund has been recorded on the payment contract |
+
+`retry_refund_sync` needs no authorization. It can only push a refund that is already processed, and the payment contract applies each `refund_id` at most once.
+
+| Error | Code | When |
+| --- | --- | --- |
+| `CoreError::RefundNotFound` | `2` | No refund with this ID |
+| `CoreError::InvalidStatus` | `7` | The refund is not `Processed` |
+| `CoreError::PaymentContractNotSet` | `27` | No payment contract address is configured |
+| `ExtError::RefundAlreadySynced` | `82` | The refund was already recorded on the payment contract |
+
+| Event | Fields | Emitted |
+| --- | --- | --- |
+| `RefundPaymentSynced` | `refund_id`, `payment_id`, `amount` | The payment contract accepted the update |
+| `RefundPaymentSyncFailed` | `refund_id`, `payment_id`, `payment_contract_set` | The sync was skipped (no payment contract) or rejected |
+
 ### Analytics
 
 - `get_refund_analytics()` — Overall contract analytics (totals, approval rate, etc.).
@@ -792,6 +822,8 @@ The contract emits Soroban events for all state-changing operations. Off-chain i
 | `RefundApproved`  | `RefundApproved`  | `refund_id`, `payment_id`, `amount`, `approved_by`, `approved_at`          | `approve_refund()` moves refund to `Approved` status                 |
 | `RefundRejected`  | `RefundRejected`  | `refund_id`, `rejected_by`, `rejected_at`, `rejection_reason`              | `reject_refund()` moves refund to `PendingAppeal` status             |
 | `RefundProcessed` | `RefundProcessed` | `refund_id`, `processed_by`, `customer`, `amount`, `token`, `processed_at` | `process_refund()` executes approved refund and moves to `Processed` |
+| `RefundPaymentSynced` | `refund_payment_synced` | `refund_id`, `payment_id`, `amount` | A processed refund is recorded on the payment contract (#809) |
+| `RefundPaymentSyncFailed` | `refund_payment_sync_failed` | `refund_id`, `payment_id`, `payment_contract_set` | The payment-contract sync is skipped or rejected; the payout stands (#809) |
 | `RefundWithdrawn` | `refund_withdrawn` | `refund_id`, `payment_id`, `customer`, `amount`, `withdrawn_at` | `withdraw_refund_request()` moves refund to `Withdrawn` status |
 | `CounterOfferMade` | `counter_offer_made` | `refund_id`, `merchant`, `requested_amount`, `offered_amount`, `expires_at` | `counter_offer()` records a merchant counter-offer |
 | `CounterOfferAccepted` | `counter_offer_accepted` | `refund_id`, `customer`, `requested_amount`, `accepted_amount` | `accept_counter_offer()` approves the refund at the offered amount |
