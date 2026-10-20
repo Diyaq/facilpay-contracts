@@ -180,6 +180,10 @@ pub enum SystemKey {
     // Tracks the distinct (window_start, window_end) pairs cached above, so a newly
     // processed refund can invalidate only the windows it actually falls within.
     AnalyticsCacheWindows,
+    // Processing deadline configuration for approved refunds
+    RefundProcessingDeadlineConfig,
+    // Tracks when refund was approved for deadline enforcement
+    RefundApprovedTimestamp(u64),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -357,6 +361,9 @@ pub enum ExtError {
     // Issue #806: bulk promotional voucher issuance
     EmptyPromotionalBatch = 80,
     PromotionalBatchTooLarge = 81,
+    // Processing deadline for approved refunds
+    ProcessingDeadlineMissed = 82,
+    ProcessingDeadlineNotConfigured = 83,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -662,6 +669,23 @@ pub struct RefundVoucher {
     pub issued_at: u64,
     pub expires_at: u64,
     pub redeemed: bool,
+}
+
+// Processing deadline configuration for approved refunds
+#[derive(Clone)]
+#[contracttype]
+pub struct RefundProcessingDeadlineConfig {
+    pub deadline_seconds: u64,
+    pub enabled: bool,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcessingDeadlineMissed {
+    pub refund_id: u64,
+    pub approved_at: u64,
+    pub deadline: u64,
+    pub current_time: u64,
 }
 
 // Issue #696: merchant counter-offer for a partial refund
@@ -3931,6 +3955,143 @@ impl RefundContract {
         Ok(())
     }
 
+    /// Set the processing deadline for approved refunds.
+    ///
+    /// Once configured, approved refunds must be processed within the deadline_seconds
+    /// from their approval timestamp, otherwise they become enforceable by customers.
+    ///
+    /// # Arguments
+    /// * `admin` - The contract admin setting the deadline configuration.
+    /// * `deadline_seconds` - The deadline duration in seconds (e.g., 3 days = 259200).
+    /// * `enabled` - Whether the deadline enforcement is enabled.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the contract admin.
+    pub fn set_processing_deadline_config(
+        env: Env,
+        admin: Address,
+        deadline_seconds: u64,
+        enabled: bool,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        
+        let config = RefundProcessingDeadlineConfig {
+            deadline_seconds,
+            enabled,
+        };
+        
+        env.storage()
+            .instance()
+            .set(&SystemKey::RefundProcessingDeadlineConfig, &config);
+        
+        Ok(())
+    }
+
+    /// Get the current processing deadline configuration.
+    ///
+    /// # Returns
+    /// The processing deadline configuration, or a default config (disabled) if not set.
+    pub fn get_processing_deadline_config(env: Env) -> RefundProcessingDeadlineConfig {
+        env.storage()
+            .instance()
+            .get(&SystemKey::RefundProcessingDeadlineConfig)
+            .unwrap_or(RefundProcessingDeadlineConfig {
+                deadline_seconds: 259200, // 3 days default
+                enabled: false,
+            })
+    }
+
+    /// Check if an approved refund has exceeded its processing deadline.
+    ///
+    /// # Arguments
+    /// * `refund_id` - The ID of the refund to check.
+    ///
+    /// # Returns
+    /// `true` if the deadline has been exceeded, `false` otherwise.
+    ///
+    /// # Errors
+    /// Returns `RefundNotFound` if the refund does not exist.
+    /// Returns `InvalidStatus` if the refund is not in `Approved` status.
+    /// Returns `ProcessingDeadlineNotConfigured` if deadline enforcement is disabled.
+    pub fn check_processing_deadline(env: Env, refund_id: u64) -> Result<bool, Error> {
+        let config = Self::get_processing_deadline_config(env.clone());
+        if !config.enabled {
+            return Err(Error::Ext(ExtError::ProcessingDeadlineNotConfigured));
+        }
+
+        let refund: Refund = env
+            .storage()
+            .instance()
+            .get(&DataKey::Refund(refund_id))
+            .ok_or(Error::Core(CoreError::RefundNotFound))?;
+
+        if refund.status != RefundStatus::Approved {
+            return Err(Error::Core(CoreError::InvalidStatus));
+        }
+
+        let approved_at = refund
+            .approved_at
+            .ok_or(Error::Core(CoreError::InvalidStatus))?;
+
+        let deadline = approved_at + config.deadline_seconds;
+        let now = env.ledger().timestamp();
+
+        if now >= deadline {
+            ProcessingDeadlineMissed {
+                refund_id,
+                approved_at,
+                deadline,
+                current_time: now,
+            }
+            .publish(&env);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Enforce processing deadline for a refund.
+    ///
+    /// If an approved refund has exceeded its processing deadline, this method can be
+    /// called by the customer to automatically process it or escalate it to arbitration.
+    ///
+    /// # Arguments
+    /// * `customer` - The customer enforcing the deadline (must be the refund's customer).
+    /// * `refund_id` - The ID of the refund to enforce.
+    ///
+    /// # Errors
+    /// Returns `RefundNotFound` if the refund does not exist.
+    /// Returns `Unauthorized` if the caller is not the refund's customer.
+    /// Returns `ProcessingDeadlineMissed` if the deadline has not been exceeded.
+    pub fn enforce_processing_deadline(
+        env: Env,
+        customer: Address,
+        refund_id: u64,
+    ) -> Result<(), Error> {
+        customer.require_auth();
+        
+        let refund: Refund = env
+            .storage()
+            .instance()
+            .get(&DataKey::Refund(refund_id))
+            .ok_or(Error::Core(CoreError::RefundNotFound))?;
+
+        if refund.customer != customer {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+
+        let deadline_exceeded = Self::check_processing_deadline(env.clone(), refund_id)?;
+        if !deadline_exceeded {
+            return Err(Error::Ext(ExtError::ProcessingDeadlineMissed));
+        }
+
+        // Automatically process the refund
+        Self::process_refund_internal(&env, customer, refund_id)?;
+
+        Ok(())
+    }
+
     fn store_refund_policy(
         env: &Env,
         merchant: Address,
@@ -6784,10 +6945,15 @@ impl RefundContract {
         Self::clear_sla_deadline(env, refund_id);
         refund.status = RefundStatus::Approved;
         // Issue #147: Set approved_at timestamp
-        refund.approved_at = Some(env.ledger().timestamp());
+        let approved_at = env.ledger().timestamp();
+        refund.approved_at = Some(approved_at);
         env.storage()
             .instance()
             .set(&DataKey::Refund(refund_id), &refund);
+        // Store approved timestamp for deadline tracking
+        env.storage()
+            .instance()
+            .set(&SystemKey::RefundApprovedTimestamp(refund_id), &approved_at);
         Self::add_to_status_index(env, RefundStatus::Approved, refund_id);
 
         (RefundApproved {
@@ -11279,3 +11445,6 @@ mod test_upgrade;
 
 #[cfg(test)]
 mod test_refund_reserve;
+
+#[cfg(test)]
+mod test_multi_token_arbitrator;
