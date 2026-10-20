@@ -890,6 +890,10 @@ pub enum TestError {
     // Arithmetic safety
     BillingOverflow = 124,
     InvalidInterval = 125,
+    // Subscription transfer
+    SubscriptionTransferNotAllowed = 126,
+    InvalidTransferRecipient = 127,
+    SubscriptionNotTransferable = 128,
 }
 
 // Manual trait implementations replacing #[contracterror] (105 variants exceed the 50-variant XDR spec limit)
@@ -1251,6 +1255,16 @@ pub struct RecurringPaymentFailed {
 pub struct SubscriptionCancelled {
     pub subscription_id: u64,
     pub cancelled_by: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionTransferred {
+    pub subscription_id: u64,
+    pub from_customer: Address,
+    pub to_customer: Address,
+    pub transferred_by: Address,
+    pub transferred_at: u64,
 }
 
 #[contractevent]
@@ -6583,6 +6597,61 @@ impl PaymentContract {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
+    fn add_to_customer_subscriptions(env: &Env, customer: &Address, subscription_id: u64) {
+        let count: u64 = env
+            .store()
+            .get(&DataKey::Customer(CustomerDataKey::SubscriptionCount(
+                customer.clone(),
+            )))
+            .unwrap_or(0);
+        
+        let page = count / 100;
+        let page_index = count % 100;
+        
+        let key = DataKey::Customer(CustomerDataKey::Subscriptions(customer.clone(), page));
+        let mut page_subs: Vec<u64> = env.store().get(&key).unwrap_or_else(|| Vec::new(env));
+        page_subs.push_back(subscription_id);
+        env.store().set(&key, &page_subs);
+        
+        env.store().set(
+            &DataKey::Customer(CustomerDataKey::SubscriptionCount(customer.clone())),
+            &(count + 1),
+        );
+    }
+
+    fn remove_from_customer_subscriptions(env: &Env, customer: &Address, subscription_id: u64) {
+        let count: u64 = env
+            .store()
+            .get(&DataKey::Customer(CustomerDataKey::SubscriptionCount(
+                customer.clone(),
+            )))
+            .unwrap_or(0);
+        
+        if count == 0 {
+            return;
+        }
+
+        // Linear search through pages to find and remove the subscription
+        for page in 0..=((count - 1) / 100) {
+            let key = DataKey::Customer(CustomerDataKey::Subscriptions(customer.clone(), page));
+            if let Some(mut page_subs): Option<Vec<u64>> = env.store().get(&key) {
+                if let Some(pos) = page_subs.iter().position(|&id| id == subscription_id) {
+                    page_subs.remove(pos as u32);
+                    if page_subs.is_empty() {
+                        env.store().remove(&key);
+                    } else {
+                        env.store().set(&key, &page_subs);
+                    }
+                    env.store().set(
+                        &DataKey::Customer(CustomerDataKey::SubscriptionCount(customer.clone())),
+                        &(count - 1),
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
     fn is_valid_currency(currency: &Currency) -> bool {
         matches!(
             currency,
@@ -7665,6 +7734,108 @@ impl PaymentContract {
         (SubscriptionCancelled {
             subscription_id,
             cancelled_by: caller,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Transfer a subscription to another customer.
+    ///
+    /// Allows the current customer to transfer their subscription to a new customer.
+    /// The merchant can also authorize the transfer if needed.
+    ///
+    /// # Arguments
+    /// * `caller` - The current customer or merchant authorizing the transfer.
+    /// * `subscription_id` - The ID of the subscription to transfer.
+    /// * `new_customer` - The address of the new customer to receive the subscription.
+    ///
+    /// # Errors
+    /// Returns `SubscriptionNotFound` if the subscription doesn't exist.
+    /// Returns `Unauthorized` if the caller is neither the customer nor the merchant.
+    /// Returns `InvalidStatus` if the subscription is cancelled or expired.
+    /// Returns `InvalidTransferRecipient` if the new customer is the same as the current customer.
+    /// Returns `SubscriptionNotTransferable` if the subscription is in dunning or suspended status.
+    pub fn transfer_subscription(
+        env: Env,
+        caller: Address,
+        subscription_id: u64,
+        new_customer: Address,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+
+        if !env
+            .store()
+            .has(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
+        {
+            return Err(Error::Subscription(SubscriptionError::NotFound));
+        }
+
+        let mut sub: Subscription = env
+            .store()
+            .get(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
+            .unwrap();
+
+        // Only customer or merchant can transfer
+        let is_authorized = sub.customer == caller || sub.merchant == caller;
+        if !is_authorized {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        // Cannot transfer cancelled or expired subscriptions
+        if sub.status == SubscriptionStatus::Cancelled || sub.status == SubscriptionStatus::Expired
+        {
+            return Err(Error::Payment(PaymentError::InvalidStatus));
+        }
+
+        // Cannot transfer subscriptions in dunning or suspended status
+        if sub.status == SubscriptionStatus::InDunning
+            || sub.status == SubscriptionStatus::Suspended
+        {
+            return Err(Error::Payment(PaymentError::SubscriptionNotTransferable));
+        }
+
+        // New customer must be different from current customer
+        if sub.customer == new_customer {
+            return Err(Error::Payment(PaymentError::InvalidTransferRecipient));
+        }
+
+        let old_customer = sub.customer.clone();
+
+        // Update subscription with new customer
+        sub.customer = new_customer.clone();
+        env.store().set(
+            &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
+            &sub,
+        );
+
+        // Update customer subscription indices
+        // Remove from old customer's subscription list
+        Self::remove_from_customer_subscriptions(&env, &old_customer, subscription_id);
+
+        // Add to new customer's subscription list
+        Self::add_to_customer_subscriptions(&env, &new_customer, subscription_id);
+
+        // Transfer any dunning state to new customer if it exists
+        if let Some(dunning_state): Option<DunningState> = env.store().get(&DataKey::Subscription(
+            SubscriptionKey::DunningState(subscription_id),
+        )) {
+            env.store().remove(&DataKey::Subscription(
+                SubscriptionKey::DunningState(subscription_id),
+            ));
+            // Clear dunning for clean transfer
+        }
+
+        (SubscriptionTransferred {
+            subscription_id,
+            from_customer: old_customer,
+            to_customer: new_customer,
+            transferred_by: caller,
+            transferred_at: env.ledger().timestamp(),
         })
         .publish(&env);
 
