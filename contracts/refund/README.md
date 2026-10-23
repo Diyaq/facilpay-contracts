@@ -294,6 +294,7 @@ Emits `CounterOfferMade` from `counter_offer`. Emits `CounterOfferAccepted` and 
 - `get_merchant_refund_summary()` — Aggregate refund stats for a merchant.
 - `get_refunds_by_reason_code()` — Paginated refunds filtered by canonical reason code.
 - `get_reason_code_analytics(window_start, window_end)` — Counts refunds by reason code within the given ledger-timestamp window, sorted by frequency. Cached per window and invalidated only when a refund inside that window is processed.
+- `get_refund_reserve()` — Returns the merchant's current refund reserve balance for a token.
 - `get_total_refunded_amount()` — Cumulative refunded amount for a given payment.
 - `can_refund_payment()` — Checks if a refund would exceed the original payment amount.
 
@@ -827,6 +828,7 @@ The contract emits Soroban events for all state-changing operations. Off-chain i
 | `RefundWithdrawn` | `refund_withdrawn` | `refund_id`, `payment_id`, `customer`, `amount`, `withdrawn_at` | `withdraw_refund_request()` moves refund to `Withdrawn` status |
 | `CounterOfferMade` | `counter_offer_made` | `refund_id`, `merchant`, `requested_amount`, `offered_amount`, `expires_at` | `counter_offer()` records a merchant counter-offer |
 | `CounterOfferAccepted` | `counter_offer_accepted` | `refund_id`, `customer`, `requested_amount`, `accepted_amount` | `accept_counter_offer()` approves the refund at the offered amount |
+| `RefundReserveLow` | `refund_reserve_low` | `merchant`, `token`, `balance`, `warning_level` | A withdrawal or refund drops the merchant's reserve below its warning level (fires once per crossing) |
 
 ### Voucher Events
 
@@ -909,6 +911,26 @@ Customer tier changes (`set_customer_tier`, `set_customer_tier_policy`, `set_str
 | Event                        | Topic Name                   | Payload Fields                           | Fires When                                                                      |
 | ---------------------------- | ---------------------------- | ---------------------------------------- | ------------------------------------------------------------------------------- |
 | `CircuitBreakerTrippedEvent` | `CircuitBreakerTrippedEvent` | `triggered_by`, `reason`, `triggered_at` | Circuit breaker activates due to refund volume threshold or error rate exceeded |
+
+---
+
+## 💰 Refund Reserve & Low-Reserve Alerts
+
+Merchants keep a per-token refund reserve on the contract. Refunds and withdrawals draw down this reserve, and a merchant can set a warning level so they are alerted before the reserve is empty and refunds start failing.
+
+| Function | Parameters | Returns | Auth |
+| --- | --- | --- | --- |
+| `set_refund_reserve_warning_level` | `merchant: Address`, `token: Address`, `warning_level: i128` | `Result<(), Error>` | `merchant` |
+| `get_refund_reserve_warning_level` | `merchant: Address`, `token: Address` | `Option<i128>` (`None` if not set) | — |
+| `get_refund_reserve` | `merchant: Address`, `token: Address` | `i128` | — |
+
+`set_refund_reserve_warning_level` stores the level at which the merchant wants to be warned. `warning_level` must be `>= 0`; a negative value fails with `CoreError::InvalidAmount` (1). Setting the level does not emit an event by itself.
+
+**When `RefundReserveLow` fires.** The event is emitted from any path that reduces the reserve (a refund payout or a reserve withdrawal) when the resulting balance is **below** the merchant's warning level. It fires only on the transition: once the reserve is already below the level, further reductions do not re-emit it. The alert re-arms after the reserve is topped back up to or above the warning level. If no warning level is set for the merchant/token pair, no alert is emitted.
+
+`RefundReserveLow` payload: `merchant`, `token`, `balance` (the new reserve balance), `warning_level` (the configured level at the time of the crossing).
+
+`get_refund_reserve` returns the merchant's current reserve balance for `token` (`0` if no reserve has been deposited).
 
 ---
 
